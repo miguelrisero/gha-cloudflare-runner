@@ -1,0 +1,11 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "scale-set-create-regression-test",
+  "main": "scale-set-create-harness.js",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "CONTROL_TOKEN": "control-token-with-at-least-32-characters",
+    "GITHUB_TOKEN": "literal-github-token-secret"
+  }
+}

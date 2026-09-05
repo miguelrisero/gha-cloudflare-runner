@@ -1,0 +1,41 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "scaleset-listener-regression-test",
+  "main": "scaleset-listener-harness.js",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "CONTROL_TOKEN": "control-token-with-at-least-32-characters",
+    "GITHUB_REPOSITORY": "example/runner-test",
+    "GITHUB_TOKEN": "github-token-secret",
+    "OUTAGE_GATE_TOKEN": "outage-gate-token-with-at-least-32-characters",
+    "RUNNER_LABELS": "cloudflare-sandbox",
+    "AUTOPILOT_SCALE_SETS": "{\"example-scale-set\":{\"actionsServiceUrl\":\"https://actions.stub.test/tenant\",\"adminToken\":\"literal-admin-token-secret\",\"adminTokenExpiresAtMs\":8000000000000000,\"owner\":\"listener-owner\",\"outageGateCloseUrl\":\"https://outage-gate.stub.test/close\",\"outageGateUrl\":\"https://outage-gate.stub.test/permit\",\"repository\":\"example/runner-test\",\"runnerGroupId\":17,\"scaleSetId\":101,\"wave\":\"wave-1\",\"workerUrl\":\"https://worker.stub.test\"}}"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ScaleSetListener",
+        "class_name": "ScaleSetListener"
+      },
+      {
+        "name": "AutopilotControl",
+        "class_name": "AutopilotControl"
+      },
+      {
+        "name": "RunnerRegistry",
+        "class_name": "RunnerRegistry"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ScaleSetListener",
+        "AutopilotControl",
+        "RunnerRegistry"
+      ]
+    }
+  ]
+}

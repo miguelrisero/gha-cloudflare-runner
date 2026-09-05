@@ -1,0 +1,86 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gha-cloudflare-runner",
+  "main": "src/worker.js",
+  // Set CLOUDFLARE_ACCOUNT_ID in the environment instead of pinning an
+  // account here, so a fork deploys to its own account unchanged.
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  // A deploy must never delete a variable that exists only in the dashboard.
+  // Variables declared below still override dashboard values during a deploy.
+  "keep_vars": true,
+  "vars": {
+    "GITHUB_REPOSITORY": "your-org/your-repo",
+    "GITHUB_REPOSITORY_ALLOWLIST": ["your-org/your-repo"],
+    "RUNNER_LABELS": "cloudflare-sandbox"
+  },
+  "secrets": {
+    "required": [
+      "CAPACITY_APPROVAL_PUBLIC_KEY",
+      "CONTROL_TOKEN",
+      "GITHUB_TOKEN",
+      "OUTAGE_GATE_PUBLIC_KEY",
+      "OUTAGE_GATE_TOKEN"
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./container/Dockerfile",
+      // standard-4 is the platform ceiling: 4 vCPU, 12 GiB memory, 20 GB disk.
+      "instance_type": "standard-4",
+      // 1500 / 4 = 375 is the hard maximum. 300 leaves 20% headroom.
+      // vCPU is the binding constraint; memory and disk remain far below limits.
+      "max_instances": 300
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "Sandbox",
+        "class_name": "Sandbox"
+      },
+      {
+        "name": "RunnerRegistry",
+        "class_name": "RunnerRegistry"
+      },
+      {
+        "name": "AutopilotControl",
+        "class_name": "AutopilotControl"
+      },
+      {
+        "name": "ScaleSetListener",
+        "class_name": "ScaleSetListener"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Sandbox"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RunnerRegistry"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["AutopilotControl"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["ScaleSetListener"]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  }
+}

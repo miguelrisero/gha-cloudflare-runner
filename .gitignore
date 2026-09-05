@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/
+*.py[cod]
+results/raw/
+tmp/

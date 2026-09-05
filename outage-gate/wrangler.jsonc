@@ -1,0 +1,45 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "gha-outage-gate",
+  // Set CLOUDFLARE_ACCOUNT_ID in the environment instead.
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "OUTAGE_GATE_REPOSITORY_ALLOWLIST": [
+      "your-org/your-repo"
+    ]
+  },
+  "secrets": {
+    "required": [
+      "OUTAGE_GATE_PRIVATE_KEY",
+      "OUTAGE_GATE_TOKEN",
+      "OUTAGE_GATE_ADMIN_TOKEN"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "OutageGate",
+        "class_name": "OutageGate"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["OutageGate"]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  }
+}

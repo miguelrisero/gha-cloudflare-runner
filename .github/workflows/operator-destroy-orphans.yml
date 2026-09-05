@@ -1,0 +1,767 @@
+name: Operator destroy orphans
+
+on:
+  schedule:
+    # Two passes per hour, after the :17 audit. The operator route needs two
+    # observations more than 60 seconds apart: the first pass records the
+    # orphan observation and returns inside-grace, the second pass destroys.
+    - cron: '37,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: >-
+          Send evidence-validated operator destroy requests. Leave false to perform a dry run.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: { group: operator-destroy-orphans, cancel-in-progress: false }
+
+jobs:
+  destroy:
+    name: Destroy registry-independent orphans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Preflight the operator configuration
+        id: preflight
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          AUDIT_GITHUB_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          # GitHub forbids the GITHUB_ prefix on Actions configuration variables.
+          # AUDIT_RUNNER_SCOPE maps to the contract shared with src/worker.js.
+          GITHUB_RUNNER_SCOPE: ${{ vars.AUDIT_RUNNER_SCOPE }}
+        run: |
+          set -euo pipefail
+          record_preflight_failure() {
+            local reason=$1
+            local action=$2
+            {
+              printf 'failure_reason<<OPERATOR_DESTROY_EOF\n%s\nOPERATOR_DESTROY_EOF\n' "$reason"
+              printf 'failure_action<<OPERATOR_DESTROY_EOF\n%s\nOPERATOR_DESTROY_EOF\n' "$action"
+            } >> "$GITHUB_OUTPUT"
+          }
+          settings_path='Settings → Secrets and variables → Actions'
+          problems=()
+
+          if [[ -z "$WORKER_URL" ]]; then
+            problems+=("Repository variable WORKER_URL is missing. Create it at $settings_path.")
+          elif [[ "$WORKER_URL" != https://* ]]; then
+            problems+=("Repository variable WORKER_URL must begin with https://. Update it at $settings_path.")
+          fi
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            problems+=("Repository secret CLOUDFLARE_API_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            problems+=("Repository secret CONTROL_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ -z "$AUDIT_GITHUB_TOKEN" ]]; then
+            problems+=("Repository secret AUDIT_GITHUB_TOKEN is missing. Create it at $settings_path.")
+          fi
+
+          if (( ${#problems[@]} > 0 )); then
+            reason='Operator orphan destroy preflight failed. Fix every item below.'
+            for problem in "${problems[@]}"; do
+              reason+=$'\n- '
+              reason+="$problem"
+            done
+            action="Fix every listed item at $settings_path. Read docs/ORPHAN-RUNBOOK.md."
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Operator orphan destroy preflight::%s\n' "$action"
+            record_preflight_failure "$reason" "$action"
+            exit 1
+          fi
+
+          operator_configuration=$(
+            WORKER_URL="$WORKER_URL" node --input-type=module --eval '
+              import { unstable_readConfig } from "wrangler";
+
+              const config = await unstable_readConfig({ config: "wrangler.jsonc" });
+              const auditRepository = config.vars?.GITHUB_REPOSITORY;
+              const configRunnerScope = config.vars?.GITHUB_RUNNER_SCOPE;
+              const environmentRunnerScope = process.env.GITHUB_RUNNER_SCOPE;
+              const workerName = config.name;
+              const repositoryPattern = /^[^/\s]+\/[^/\s]+$/;
+              if (
+                typeof auditRepository !== "string"
+                || !repositoryPattern.test(auditRepository)
+              ) {
+                console.error(
+                  "Operator orphan destroy preflight failed. "
+                  + "wrangler.jsonc vars.GITHUB_REPOSITORY must be a non-empty "
+                  + "owner/repository string.",
+                );
+                process.exit(1);
+              }
+              const configuredRunnerScope =
+                typeof environmentRunnerScope === "string"
+                  && environmentRunnerScope.length > 0
+                  ? environmentRunnerScope
+                  : typeof configRunnerScope === "string"
+                    ? configRunnerScope
+                    : undefined;
+              let runnerScopePath;
+              let runnerScopeLabel;
+              if (
+                configuredRunnerScope === undefined
+                || configuredRunnerScope === null
+                || (
+                  typeof configuredRunnerScope === "string"
+                  && configuredRunnerScope.trim().length === 0
+                )
+                || configuredRunnerScope === "repository"
+              ) {
+                runnerScopePath = "repos/" + auditRepository + "/actions/runners";
+                runnerScopeLabel = "repository:" + auditRepository;
+              } else {
+                let organization;
+                if (configuredRunnerScope === "organization") {
+                  organization = auditRepository.split("/", 1)[0];
+                } else if (
+                  typeof configuredRunnerScope === "string"
+                  && configuredRunnerScope.startsWith("organization:")
+                ) {
+                  organization = configuredRunnerScope.slice(
+                    "organization:".length,
+                  );
+                } else {
+                  console.error(
+                    "GITHUB_RUNNER_SCOPE must be repository, organization, or organization:<org>",
+                  );
+                  process.exit(1);
+                }
+                if (
+                  typeof organization !== "string"
+                  || organization.trim().length === 0
+                  || organization.includes("/")
+                  || organization.includes("*")
+                  || organization.includes("..")
+                ) {
+                  console.error(
+                    "GITHUB_RUNNER_SCOPE organization must be non-empty and contain no \"/\", \"*\", or \"..\"",
+                  );
+                  process.exit(1);
+                }
+                runnerScopePath = "orgs/" + organization + "/actions/runners";
+                runnerScopeLabel = "organization:" + organization;
+              }
+              if (typeof workerName !== "string" || workerName.length === 0) {
+                console.error(
+                  "Operator orphan destroy preflight failed. "
+                  + "wrangler.jsonc name must be a non-empty string.",
+                );
+                process.exit(1);
+              }
+              let workerHost;
+              try {
+                workerHost = new URL(process.env.WORKER_URL).hostname;
+              } catch {
+                console.error(
+                  "Operator orphan destroy preflight failed. WORKER_URL must be a valid URL.",
+                );
+                process.exit(1);
+              }
+              process.stdout.write(JSON.stringify({
+                auditRepository,
+                runnerScopeLabel,
+                runnerScopePath,
+                workerHost,
+                workerName,
+              }));
+            '
+          )
+          audit_repository=$(jq -er '.auditRepository' <<<"$operator_configuration")
+          runner_scope=$(jq -er '.runnerScopeLabel' <<<"$operator_configuration")
+          runner_scope_path=$(jq -er '.runnerScopePath' <<<"$operator_configuration")
+          worker_host=$(jq -er '.workerHost' <<<"$operator_configuration")
+          worker_name=$(jq -er '.workerName' <<<"$operator_configuration")
+          worker_first_label=${worker_host%%.*}
+
+          if [[ "$worker_first_label" != "$worker_name" ]]; then
+            reason="Operator orphan destroy preflight failed: expected WORKER_URL host first label $worker_name; received host $worker_host."
+            action='A Worker deployed behind a custom domain needs this check and docs/ORPHAN-RUNBOOK.md updated together.'
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Operator orphan destroy preflight::%s %s\n' \
+              "$reason" "$action"
+            record_preflight_failure "$reason" "$action"
+            exit 1
+          fi
+
+          github_probe_error() {
+            local required_permission
+            local reason_first_line
+            local reason
+            local action
+            if [[ "$runner_scope" == organization:* ]]; then
+              required_permission="Organization \`Self-hosted runners: Read-only\`"
+            else
+              required_permission="Repository \`Administration: Read-only\`"
+            fi
+            reason_first_line="AUDIT_GITHUB_TOKEN cannot read runner scope $runner_scope at endpoint $runner_scope_path."
+            reason=$reason_first_line
+            if [[ "$runner_scope" == organization:* ]]; then
+              reason+=$'\nA token holding only repository `Administration: Read-only` gets HTTP 403 on an organization endpoint.'
+            fi
+            action="Grant $required_permission to AUDIT_GITHUB_TOKEN. Read docs/ORPHAN-RUNBOOK.md."
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Operator orphan destroy GitHub probe::%s %s\n' \
+              "$reason_first_line" "$action"
+            record_preflight_failure "$reason" "$action"
+          }
+
+          if ! github_runner_total=$(
+            gh api "$runner_scope_path" --jq '.total_count'
+          ) || [[ ! "$github_runner_total" =~ ^[0-9]+$ ]]; then
+            github_probe_error
+            exit 1
+          fi
+
+          printf 'audit_repository=%s\n' "$audit_repository" >> "$GITHUB_OUTPUT"
+          printf 'runner_scope=%s\n' "$runner_scope" >> "$GITHUB_OUTPUT"
+
+      - name: Run the operator orphan destroy
+        id: operator
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          GITHUB_RUNNER_SCOPE: ${{ vars.AUDIT_RUNNER_SCOPE }}
+          WRANGLER_SEND_METRICS: 'false'
+          ORPHAN_GRACE_SECONDS: '60' # 60 is the policy value and must not be changed.
+          DESTROY_INPUT: ${{ inputs.destroy }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          : > operator-orphan-audit.jsonl
+          : > operator-orphan-audit.stderr.log
+          : > operator-orphan-destroy.jsonl
+          : > operator-orphan-destroy.stderr.log
+          operator_args=(
+            --audit-report operator-orphan-audit.jsonl
+            --audit-stderr operator-orphan-audit.stderr.log
+          )
+          # A scheduled run always destroys. The Worker's operator route
+          # validates every request against live evidence: the registry row
+          # must be terminal or absent, the observed instance ID must match the
+          # current sandbox generation, and a 60-second grace window must have
+          # elapsed since the first observation. A manual run destroys only
+          # with the explicit input.
+          destroy_mode=false
+          if [[ "$DESTROY_INPUT" == 'true' || "${EVENT_NAME:-}" == 'schedule' ]]; then
+            operator_args+=(--destroy)
+            destroy_mode=true
+          fi
+
+          # A runner-defined GITHUB_REPOSITORY points at this control repository.
+          # The audit must read the audited runner repository from wrangler.jsonc.
+          unset GITHUB_REPOSITORY
+
+          operator_exit_code=0
+          set +e
+          scripts/operator-destroy-orphans.mjs "${operator_args[@]}" \
+            >operator-orphan-destroy.jsonl \
+            2>operator-orphan-destroy.stderr.log
+          operator_exit_code=$?
+          set -e
+
+          cat operator-orphan-destroy.jsonl
+          cat operator-orphan-audit.stderr.log >&2
+          cat operator-orphan-destroy.stderr.log >&2
+
+          exit_code=$operator_exit_code
+          summary_record=''
+          summary_assertion='failed'
+          mode_assertion='not-run'
+          count_assertion='not-run'
+          exit_code_assertion='not-run'
+          failure_reason=''
+          failure_action=''
+          records_json=''
+          result_count='unavailable'
+          if [[ -s operator-orphan-destroy.jsonl ]]; then
+            if records_json=$(jq -sc '.' operator-orphan-destroy.jsonl 2>/dev/null); then
+              summary_record=$(jq -c '
+                map(select(type == "object" and .type == "operator-orphan-summary"))
+                | if length == 1 then .[0] else empty end
+              ' <<<"$records_json")
+              result_count=$(jq -r '
+                [
+                  .[]
+                  | select(type == "object" and .type == "operator-orphan-result")
+                ]
+                | length
+              ' <<<"$records_json")
+            fi
+          fi
+
+          if [[ -n "$summary_record" ]]; then
+            summary_assertion='passed'
+            mode_assertion='passed'
+            count_assertion='passed'
+            exit_code_assertion='passed'
+            if ! jq -e --argjson expected "$destroy_mode" \
+              '.destroy == $expected' >/dev/null <<<"$summary_record"; then
+              mode_assertion='failed'
+              exit_code=2
+              failure_reason='The operator summary destroy mode does not match the workflow input.'
+            fi
+            if ! jq -e '
+              [
+                .[]
+                | select(
+                    type == "object"
+                    and .type == "operator-orphan-result"
+                  )
+              ] as $results
+              | [
+                  .[]
+                  | select(
+                      type == "object"
+                      and .type == "operator-orphan-summary"
+                    )
+                ][0] as $summary
+              | ($results | map(select(.outcome == "destroyed")) | length)
+                  as $destroyedCount
+              | ($results | map(select(.outcome == "dry-run")) | length)
+                  as $dryRunCount
+              | ($results | map(select(.outcome == "inside-grace")) | length)
+                  as $insideGraceCount
+              | ($results | map(select(
+                  .outcome == "invalid-request"
+                  or .outcome == "live-row"
+                  or .outcome == "observation-mismatch"
+                  or .outcome == "revision-conflict"
+                  or .outcome == "sandbox-generation-mismatch"
+                  or .outcome == "terminal-generation-unverified"
+                  or .outcome == "claim-conflict"
+                  or .outcome == "runner-busy"
+                  or .outcome == "runner-online"
+                  or .outcome == "registration-observation-mismatch"
+                  or .outcome == "refused-finding"
+                )) | length) as $actionRequiredCount
+              | ($results | map(select(.outcome == "operational-error")) | length)
+                  as $operationalFailureCount
+              | ($results | map(select(has("request"))) | length)
+                  as $requestCount
+              | ($results | map(select(.requestSent == true)) | length)
+                  as $sentCount
+              | ($results | map(select(.terminalResolution == true)) | length)
+                  as $terminalResolutionCount
+              | ($results | map(select(.terminalResolution != true)) | length)
+                  as $unresolvedCount
+              | $summary.findingCount == ($results | length)
+              and $summary.requestCount == $requestCount
+              and $summary.sentCount == $sentCount
+              and $summary.destroyedCount == $destroyedCount
+              and $summary.dryRunCount == $dryRunCount
+              and $summary.insideGraceCount == $insideGraceCount
+              and $summary.actionRequiredCount == $actionRequiredCount
+              and $summary.terminalResolutionCount == $terminalResolutionCount
+              and $summary.unresolvedCount == $unresolvedCount
+              and $summary.operationalFailureCount == $operationalFailureCount
+              and $terminalResolutionCount == $destroyedCount
+              and all($results[];
+                if .outcome == "destroyed" then
+                  .terminalResolution == true
+                else
+                  .terminalResolution == false
+                end
+              )
+              and (
+                $destroyedCount
+                + $dryRunCount
+                + $insideGraceCount
+                + $actionRequiredCount
+                + $operationalFailureCount
+                == ($results | length)
+              )
+            ' >/dev/null <<<"$records_json"; then
+              count_assertion='failed'
+              exit_code=2
+              failure_reason='The operator summary counts do not match the result records.'
+            fi
+            if ! jq -e --argjson expected "$operator_exit_code" '
+              .exitCode == $expected
+              and (
+                (
+                  .exitCode == 0
+                  and .actionRequiredCount == 0
+                  and .operationalFailureCount == 0
+                )
+                or (
+                  .exitCode == 1
+                  and .actionRequiredCount > 0
+                  and .operationalFailureCount == 0
+                )
+                or (.exitCode == 2 and .operationalFailureCount > 0)
+              )
+            ' >/dev/null <<<"$summary_record"; then
+              exit_code_assertion='failed'
+              exit_code=2
+              failure_reason='The operator summary exit code does not match its resolution counts.'
+            fi
+          else
+            exit_code=2
+            failure_reason='The operator tool did not produce exactly one summary record.'
+          fi
+
+          if [[ "$exit_code" == '2' && -z "$failure_reason" ]]; then
+            failure_reason="The operator tool exited with operational code $operator_exit_code."
+          fi
+          if [[ -n "$failure_reason" ]]; then
+            failure_action='Read the archived evidence and docs/ORPHAN-RUNBOOK.md.'
+            printf '\n::error title=Operator orphan destroy::%s\n' "$failure_reason"
+          fi
+
+          {
+            printf 'exit_code=%s\n' "$exit_code"
+            printf 'destroy_mode=%s\n' "$destroy_mode"
+            printf 'summary_assertion=%s\n' "$summary_assertion"
+            printf 'mode_assertion=%s\n' "$mode_assertion"
+            printf 'count_assertion=%s\n' "$count_assertion"
+            printf 'exit_code_assertion=%s\n' "$exit_code_assertion"
+            printf 'result_count=%s\n' "$result_count"
+            printf 'failure_reason<<OPERATOR_DESTROY_EOF\n%s\nOPERATOR_DESTROY_EOF\n' "$failure_reason"
+            printf 'failure_action<<OPERATOR_DESTROY_EOF\n%s\nOPERATOR_DESTROY_EOF\n' "$failure_action"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the operator summary
+        if: always() && steps.operator.outcome != 'skipped'
+        shell: bash
+        env:
+          OPERATOR_EXIT_CODE: ${{ steps.operator.outputs.exit_code }}
+          DESTROY_MODE: ${{ steps.operator.outputs.destroy_mode }}
+          SUMMARY_ASSERTION: ${{ steps.operator.outputs.summary_assertion }}
+          MODE_ASSERTION: ${{ steps.operator.outputs.mode_assertion }}
+          COUNT_ASSERTION: ${{ steps.operator.outputs.count_assertion }}
+          EXIT_CODE_ASSERTION: ${{ steps.operator.outputs.exit_code_assertion }}
+          RESULT_COUNT: ${{ steps.operator.outputs.result_count }}
+          RUNBOOK_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/ORPHAN-RUNBOOK.md
+        run: |
+          set -euo pipefail
+          exit_code="${OPERATOR_EXIT_CODE:-2}"
+          case "$exit_code" in
+            0) meaning='the operator run completed without an action-required outcome' ;;
+            1) meaning='one or more selected sandboxes remain unresolved' ;;
+            *)
+              exit_code=2
+              meaning='the operator tool had an operational failure'
+              ;;
+          esac
+          {
+            printf '# Operator orphan destroy: exit code \x60%s\x60 — %s\n\n' \
+              "$exit_code" "$meaning"
+            printf '**Destroy mode:** \x60%s\x60\n\n' "${DESTROY_MODE:-false}"
+            printf '## Assertions\n\n'
+            printf '| Assertion | Result |\n'
+            printf '| --- | --- |\n'
+            printf '| One operator summary exists | \x60%s\x60 |\n' "$SUMMARY_ASSERTION"
+            printf '| The summary mode matches the input | \x60%s\x60 |\n' "$MODE_ASSERTION"
+            printf '| The summary counts match \x60%s\x60 result records | \x60%s\x60 |\n' \
+              "$RESULT_COUNT" "$COUNT_ASSERTION"
+            printf '| The exit code matches the resolution counts | \x60%s\x60 |\n\n' \
+              "$EXIT_CODE_ASSERTION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -s operator-orphan-destroy.jsonl ]]; then
+            printf 'No operator result record is available.\n\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+            printf '[Open \x60docs/ORPHAN-RUNBOOK.md\x60](%s)\n' "$RUNBOOK_URL" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          records_json=$(jq -sc '.' operator-orphan-destroy.jsonl)
+          summary_record=$(jq -c '
+            map(select(type == "object" and .type == "operator-orphan-summary"))
+            | last // empty
+          ' <<<"$records_json")
+          if [[ -n "$summary_record" ]]; then
+            summary_rows=$(jq -r '
+              def cell: if . == null then "null" else tostring end;
+              "| `findingCount` | \(.findingCount | cell) |\n" +
+              "| `requestCount` | \(.requestCount | cell) |\n" +
+              "| `sentCount` | \(.sentCount | cell) |\n" +
+              "| `destroyedCount` | \(.destroyedCount | cell) |\n" +
+              "| `dryRunCount` | \(.dryRunCount | cell) |\n" +
+              "| `insideGraceCount` | \(.insideGraceCount | cell) |\n" +
+              "| `actionRequiredCount` | \(.actionRequiredCount | cell) |\n" +
+              "| `terminalResolutionCount` | \(.terminalResolutionCount | cell) |\n" +
+              "| `unresolvedCount` | \(.unresolvedCount | cell) |\n" +
+              "| `operationalFailureCount` | \(.operationalFailureCount | cell) |"
+            ' <<<"$summary_record")
+            {
+              printf '## Counts\n\n'
+              printf '| Counter | Value |\n'
+              printf '| --- | ---: |\n'
+              printf '%s\n\n' "$summary_rows"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          inside_grace_count=$(jq -r '
+            [
+              .[]
+              | select(
+                  type == "object"
+                  and .type == "operator-orphan-result"
+                  and .outcome == "inside-grace"
+                )
+            ]
+            | length
+          ' <<<"$records_json")
+          if ((inside_grace_count > 0)); then
+            sandbox_noun='sandboxes'
+            sandbox_reference='these sandboxes'
+            if ((inside_grace_count == 1)); then
+              sandbox_noun='sandbox'
+              sandbox_reference='this sandbox'
+            fi
+            {
+              printf '> [!NOTE]\n'
+              printf '> The orphan observation is recorded for \x60%s\x60 %s.\n' \
+                "$inside_grace_count" "$sandbox_noun"
+              printf '> A second destroy run after the 60-second grace window will destroy %s.\n\n' \
+                "$sandbox_reference"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          result_rows=$(jq -r '
+            def cell:
+              if . == null then "null" else tostring end
+              | gsub("\\|"; "\\|")
+              | gsub("[\\r\\n]"; " ");
+            .[]
+            | select(type == "object" and .type == "operator-orphan-result")
+            | [
+                .sandboxId,
+                .reason,
+                .outcome,
+                .httpStatus,
+                .terminalResolution
+              ]
+            | map(cell)
+            | "| `" + join("` | `") + "` |"
+          ' <<<"$records_json")
+          if [[ -n "$result_rows" ]]; then
+            {
+              printf '## Results\n\n'
+              printf '| \x60sandboxId\x60 | \x60reason\x60 | \x60outcome\x60 | \x60httpStatus\x60 | Terminal resolution |\n'
+              printf '| --- | --- | --- | ---: | --- |\n'
+              printf '%s\n\n' "$result_rows"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## Results\n\nNo operator-route findings were selected.\n\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '[Open \x60docs/ORPHAN-RUNBOOK.md\x60](%s)\n' "$RUNBOOK_URL" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the operator record
+        if: always() && steps.operator.outcome != 'skipped'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: operator-destroy-orphans-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            operator-orphan-audit.jsonl
+            operator-orphan-audit.stderr.log
+            operator-orphan-destroy.jsonl
+            operator-orphan-destroy.stderr.log
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Alert on the operator result
+        if: always()
+        shell: bash
+        env:
+          OPERATOR_EXIT_CODE: ${{ steps.operator.outputs.exit_code }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          OPERATOR_OUTCOME: ${{ steps.operator.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          PREFLIGHT_FAILURE_REASON: ${{ steps.preflight.outputs.failure_reason }}
+          PREFLIGHT_FAILURE_ACTION: ${{ steps.preflight.outputs.failure_action }}
+          OPERATOR_FAILURE_REASON: ${{ steps.operator.outputs.failure_reason }}
+          OPERATOR_FAILURE_ACTION: ${{ steps.operator.outputs.failure_action }}
+          SLACK_WEBHOOK_URL: ${{ secrets.ORPHAN_AUDIT_SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNBOOK_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/ORPHAN-RUNBOOK.md
+        run: |
+          set -euo pipefail
+          exit_code="${OPERATOR_EXIT_CODE:-2}"
+          if [[ "$OPERATOR_OUTCOME" == 'skipped' ]]; then
+            exit_code=2
+            if [[ "$PREFLIGHT_OUTCOME" == 'failure' ]]; then
+              meaning='the operator preflight failed'
+            else
+              meaning='the workflow failed before the operator tool ran'
+            fi
+          else
+            case "$exit_code" in
+              0)
+                if [[ "$JOB_STATUS" == 'success' ]]; then
+                  exit 0
+                fi
+                meaning='the workflow failed after terminal resolution'
+                ;;
+              1) meaning='one or more selected sandboxes remain unresolved' ;;
+              *)
+                exit_code=2
+                meaning='the operator tool had an operational failure'
+                ;;
+            esac
+          fi
+
+          failure_reason=''
+          failure_action=''
+          if [[ "$OPERATOR_OUTCOME" == 'skipped' ]]; then
+            failure_reason="${PREFLIGHT_FAILURE_REASON:-}"
+            failure_action="${PREFLIGHT_FAILURE_ACTION:-}"
+          else
+            failure_reason="${OPERATOR_FAILURE_REASON:-}"
+            failure_action="${OPERATOR_FAILURE_ACTION:-}"
+          fi
+          if [[ -z "$failure_reason" ]]; then
+            failure_reason=$meaning
+          fi
+          if [[ -z "$failure_action" ]]; then
+            if [[ "$exit_code" == '1' ]]; then
+              failure_action='Re-observe stale evidence or follow the reported outcome in docs/ORPHAN-RUNBOOK.md.'
+            else
+              failure_action='Open the run log and read docs/ORPHAN-RUNBOOK.md.'
+            fi
+          fi
+
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            printf '\n::warning title=Operator orphan destroy alert degraded::Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$exit_code" == '1' ]]; then
+            header_text='Operator orphan destroy: unresolved'
+            color='#e8912d'
+          else
+            header_text='Operator orphan destroy: operational failure'
+            color='#d13212'
+          fi
+          first_failure_line=${failure_reason%%$'\n'*}
+          printf -v fallback 'Operator orphan destroy exit code %s — %s' \
+            "$exit_code" "$first_failure_line"
+          printf -v cause_text '*What happened*\n%s' "$failure_reason"
+          printf -v action_text '*Do this*\n%s' "$failure_action"
+          # shellcheck disable=SC2016 # Backticks are literal Slack formatting.
+          printf -v context_text \
+            'exit code `%s` · <%s|Open the run> · <%s|Runbook>' \
+            "$exit_code" "$RUN_URL" "$RUNBOOK_URL"
+
+          # shellcheck disable=SC2016 # The single-quoted text is a jq program.
+          payload=$(jq -n \
+            --arg fallback "$fallback" \
+            --arg headerText "$header_text" \
+            --arg color "$color" \
+            --arg causeText "$cause_text" \
+            --arg actionText "$action_text" \
+            --arg contextText "$context_text" '
+              {
+                text: $fallback,
+                attachments: [
+                  {
+                    color: $color,
+                    fallback: $fallback,
+                    blocks: [
+                      {
+                        type: "header",
+                        text: {
+                          type: "plain_text",
+                          text: ($headerText | .[0:150])
+                        }
+                      },
+                      {
+                        type: "section",
+                        text: {
+                          type: "mrkdwn",
+                          text: ($causeText | .[0:3000])
+                        }
+                      },
+                      {
+                        type: "section",
+                        text: {
+                          type: "mrkdwn",
+                          text: ($actionText | .[0:3000])
+                        }
+                      },
+                      {
+                        type: "context",
+                        elements: [
+                          {
+                            type: "mrkdwn",
+                            text: ($contextText | .[0:3000])
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ')
+          slack_response=''
+          if ! slack_response=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"); then
+            if [[ -n "$slack_response" ]]; then
+              printf '%s\n' "$slack_response" >&2
+            fi
+            printf '\n::error title=Operator orphan destroy Slack delivery::Slack delivery failed. Use the workflow result and archived operator record.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery failed. Use the workflow result and archived operator record.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set the operator result
+        if: always() && steps.operator.outcome != 'skipped'
+        shell: bash
+        env:
+          OPERATOR_EXIT_CODE: ${{ steps.operator.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          exit_code="${OPERATOR_EXIT_CODE:-2}"
+          case "$exit_code" in
+            0 | 1 | 2) exit "$exit_code" ;;
+            *)
+              printf 'The operator tool did not produce a valid exit code.\n' >&2
+              exit 2
+              ;;
+          esac

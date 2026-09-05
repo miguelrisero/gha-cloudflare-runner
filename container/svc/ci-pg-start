@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Start a throwaway PostgreSQL as the unprivileged runner user (uid 1001).
+# This runner includes Docker, but starting PostgreSQL as a local process
+# avoids a job-time package install and a container port mapping.
+# Each ephemeral runner gets a fresh cluster. The server binds to 127.0.0.1 only.
+# The command blocks until the server accepts connections.
+#
+# Usage: ci-pg-start --port 5432 --user appuser --password pw --db appdb
+set -euo pipefail
+
+PORT=5432 ROLE=postgres PASSWORD=postgres DB=postgres
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port)     PORT="$2"; shift 2;;
+    --user)     ROLE="$2"; shift 2;;
+    --password) PASSWORD="$2"; shift 2;;
+    --db)       DB="$2"; shift 2;;
+    *) echo "ci-pg-start: unknown arg '$1'" >&2; exit 2;;
+  esac
+done
+
+# Locate the highest-versioned pg bin dir via a glob (NOT `ls`, whose nonzero exit
+# on no-match would trip pipefail+set -e before the guard below could run).
+pgbins=(/usr/lib/postgresql/*/bin)
+[ -d "${pgbins[0]}" ] || { echo "ci-pg-start: no postgres install found" >&2; exit 1; }
+PGBIN="$(printf '%s\n' "${pgbins[@]}" | sort -V | tail -1)"
+export PATH="$PGBIN:$PATH"
+
+DATA="$(mktemp -d "${TMPDIR:-/tmp}/ci-pg.XXXXXX")"
+# Pin the locale: the minimal image generates no locales, so inheriting a job's
+# LANG=en_US.UTF-8 would make initdb abort. C.UTF-8 is built into glibc.
+initdb -D "$DATA" -U postgres --auth-local=trust --auth-host=trust \
+       -E UTF8 --locale=C.UTF-8 >/dev/null
+pg_ctl -D "$DATA" -w \
+       -o "-p $PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=$DATA -c fsync=off" \
+       start >/dev/null
+
+# Create the app role + database. Values are passed as psql variables and quoted
+# via format(%I/%L) so an exotic --user/--db/--password (e.g. a fork-PR ref) can't
+# inject SQL. Both are idempotent (skip if the role/db already exists).
+# Repository adaptation: spell the empty value explicitly for ShellCheck 0.11.0.
+PGPASSWORD='' psql -h 127.0.0.1 -p "$PORT" -U postgres -v ON_ERROR_STOP=1 -q \
+     -v role="$ROLE" -v pass="$PASSWORD" -v db="$DB" <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L SUPERUSER', :'role', :'pass')
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role')\gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'role')
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db')\gexec
+SQL
+
+for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p "$PORT" -q && break; sleep 1; done
+pg_isready -h 127.0.0.1 -p "$PORT" -q || { echo "ci-pg-start: postgres not ready" >&2; exit 1; }
+echo "ci-pg-start: postgres up on 127.0.0.1:${PORT} (role=${ROLE} db=${DB}, data=${DATA})"

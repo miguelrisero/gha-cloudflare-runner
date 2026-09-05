@@ -1,0 +1,1007 @@
+name: Orphan audit
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: >-
+          Send supported cleanup requests for unregistered orphans. Leave false to report only.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: { group: orphan-audit, cancel-in-progress: false }
+
+jobs:
+  audit:
+    name: Audit orphan sandboxes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Preflight the audit configuration
+        id: preflight
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          AUDIT_GITHUB_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          # GitHub forbids the GITHUB_ prefix on Actions configuration variables.
+          # AUDIT_RUNNER_SCOPE maps to the GITHUB_RUNNER_SCOPE contract shared with src/worker.js.
+          GITHUB_RUNNER_SCOPE: ${{ vars.AUDIT_RUNNER_SCOPE }}
+        run: |
+          set -euo pipefail
+          record_preflight_failure() {
+            local reason=$1
+            local action=$2
+            {
+              printf 'failure_reason<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$reason"
+              printf 'failure_action<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$action"
+            } >> "$GITHUB_OUTPUT"
+          }
+          settings_path='Settings → Secrets and variables → Actions'
+          problems=()
+
+          if [[ -z "$WORKER_URL" ]]; then
+            problems+=("Repository variable WORKER_URL is missing. Create it at $settings_path.")
+          elif [[ "$WORKER_URL" != https://* ]]; then
+            problems+=("Repository variable WORKER_URL must begin with https://. Update it at $settings_path.")
+          fi
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            problems+=("Repository secret CLOUDFLARE_API_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            problems+=("Repository secret CONTROL_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ -z "$AUDIT_GITHUB_TOKEN" ]]; then
+            problems+=("Repository secret AUDIT_GITHUB_TOKEN is missing. Create it at $settings_path.")
+          fi
+
+          if (( ${#problems[@]} > 0 )); then
+            reason='Orphan audit preflight failed. Fix every item below.'
+            for problem in "${problems[@]}"; do
+              reason+=$'\n- '
+              reason+="$problem"
+            done
+            action="Fix every listed item at $settings_path. Read docs/ORPHAN-RUNBOOK.md."
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Orphan audit preflight::%s\n' "$action"
+            record_preflight_failure "$reason" "$action"
+            exit 1
+          fi
+
+          audit_configuration=$(
+            WORKER_URL="$WORKER_URL" node --input-type=module --eval '
+              import { unstable_readConfig } from "wrangler";
+
+              const config = await unstable_readConfig({ config: "wrangler.jsonc" });
+              const auditRepository = config.vars?.GITHUB_REPOSITORY;
+              const configRunnerScope = config.vars?.GITHUB_RUNNER_SCOPE;
+              const environmentRunnerScope = process.env.GITHUB_RUNNER_SCOPE;
+              const workerName = config.name;
+              const repositoryPattern = /^[^/\s]+\/[^/\s]+$/;
+              if (
+                typeof auditRepository !== "string"
+                || !repositoryPattern.test(auditRepository)
+              ) {
+                console.error(
+                  "Orphan audit preflight failed. "
+                  + "wrangler.jsonc vars.GITHUB_REPOSITORY must be a non-empty "
+                  + "owner/repository string.",
+                );
+                process.exit(1);
+              }
+              const configuredRunnerScope =
+                typeof environmentRunnerScope === "string"
+                  && environmentRunnerScope.length > 0
+                  ? environmentRunnerScope
+                  : typeof configRunnerScope === "string"
+                    ? configRunnerScope
+                    : undefined;
+              let runnerScopePath;
+              let runnerScopeLabel;
+              if (
+                configuredRunnerScope === undefined
+                || configuredRunnerScope === null
+                || (
+                  typeof configuredRunnerScope === "string"
+                  && configuredRunnerScope.trim().length === 0
+                )
+                || configuredRunnerScope === "repository"
+              ) {
+                runnerScopePath = "repos/" + auditRepository + "/actions/runners";
+                runnerScopeLabel = "repository:" + auditRepository;
+              } else {
+                let organization;
+                if (configuredRunnerScope === "organization") {
+                  organization = auditRepository.split("/", 1)[0];
+                } else if (
+                  typeof configuredRunnerScope === "string"
+                  && configuredRunnerScope.startsWith("organization:")
+                ) {
+                  organization = configuredRunnerScope.slice(
+                    "organization:".length,
+                  );
+                } else {
+                  console.error(
+                    "GITHUB_RUNNER_SCOPE must be repository, organization, or organization:<org>",
+                  );
+                  process.exit(1);
+                }
+                if (
+                  typeof organization !== "string"
+                  || organization.trim().length === 0
+                  || organization.includes("/")
+                  || organization.includes("*")
+                  || organization.includes("..")
+                ) {
+                  console.error(
+                    "GITHUB_RUNNER_SCOPE organization must be non-empty and contain no \"/\", \"*\", or \"..\"",
+                  );
+                  process.exit(1);
+                }
+                runnerScopePath = "orgs/" + organization + "/actions/runners";
+                runnerScopeLabel = "organization:" + organization;
+              }
+              if (typeof workerName !== "string" || workerName.length === 0) {
+                console.error(
+                  "Orphan audit preflight failed. "
+                  + "wrangler.jsonc name must be a non-empty string.",
+                );
+                process.exit(1);
+              }
+              let workerHost;
+              try {
+                workerHost = new URL(process.env.WORKER_URL).hostname;
+              } catch {
+                console.error(
+                  "Orphan audit preflight failed. WORKER_URL must be a valid URL.",
+                );
+                process.exit(1);
+              }
+              process.stdout.write(JSON.stringify({
+                auditRepository,
+                runnerScopeLabel,
+                runnerScopePath,
+                workerHost,
+                workerName,
+              }));
+            '
+          )
+          audit_repository=$(jq -er '.auditRepository' <<<"$audit_configuration")
+          runner_scope=$(jq -er '.runnerScopeLabel' <<<"$audit_configuration")
+          runner_scope_path=$(jq -er '.runnerScopePath' <<<"$audit_configuration")
+          worker_host=$(jq -er '.workerHost' <<<"$audit_configuration")
+          worker_name=$(jq -er '.workerName' <<<"$audit_configuration")
+          worker_first_label=${worker_host%%.*}
+
+          if [[ "$worker_first_label" != "$worker_name" ]]; then
+            reason="Orphan audit preflight failed: expected WORKER_URL host first label $worker_name; received host $worker_host."
+            action='A Worker deployed behind a custom domain needs this check and docs/ORPHAN-RUNBOOK.md updated together.'
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Orphan audit preflight::%s %s\n' \
+              "$reason" "$action"
+            record_preflight_failure "$reason" "$action"
+            exit 1
+          fi
+
+          github_probe_error() {
+            local required_permission
+            local reason_first_line
+            local reason
+            local action
+            if [[ "$runner_scope" == organization:* ]]; then
+              required_permission="Organization \`Self-hosted runners: Read-only\`"
+            else
+              required_permission="Repository \`Administration: Read-only\`"
+            fi
+            reason_first_line="AUDIT_GITHUB_TOKEN cannot read runner scope $runner_scope at endpoint $runner_scope_path."
+            reason=$reason_first_line
+            if [[ "$runner_scope" == organization:* ]]; then
+              reason+=$'\nA token holding only repository `Administration: Read-only` gets HTTP 403 on an organization endpoint.'
+            fi
+            action="Grant $required_permission to AUDIT_GITHUB_TOKEN. Read docs/ORPHAN-RUNBOOK.md."
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Orphan audit GitHub probe::%s %s\n' \
+              "$reason_first_line" "$action"
+            record_preflight_failure "$reason" "$action"
+          }
+
+          if ! github_runner_total=$(
+            gh api "$runner_scope_path" --jq '.total_count'
+          ) || [[ ! "$github_runner_total" =~ ^[0-9]+$ ]]; then
+            github_probe_error
+            exit 1
+          fi
+
+          printf 'audit_repository=%s\n' "$audit_repository" >> "$GITHUB_OUTPUT"
+          printf 'runner_scope=%s\n' "$runner_scope" >> "$GITHUB_OUTPUT"
+
+      - name: Run the orphan audit
+        id: audit
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUDIT_GITHUB_TOKEN }}
+          GITHUB_RUNNER_SCOPE: ${{ vars.AUDIT_RUNNER_SCOPE }}
+          WRANGLER_SEND_METRICS: 'false'
+          ORPHAN_GRACE_SECONDS: '60' # 60 is the policy value and must not be changed.
+          EVENT_NAME: ${{ github.event_name }}
+          DESTROY_INPUT: ${{ inputs.destroy }}
+          AUDIT_REPOSITORY: ${{ steps.preflight.outputs.audit_repository }}
+          AUDIT_RUNNER_SCOPE: ${{ steps.preflight.outputs.runner_scope }}
+        run: |
+          set -euo pipefail
+          audit_failure_reason=''
+          audit_failure_action=''
+          record_audit_failure() {
+            local reason=$1
+            local action=$2
+            if [[ -n "$audit_failure_reason" ]]; then
+              audit_failure_reason+=$'\n'
+            fi
+            audit_failure_reason+="$reason"
+            if [[ -z "$audit_failure_action" ]]; then
+              audit_failure_action=$action
+            fi
+          }
+          fail_check() {
+            local detail="Orphan audit verification failed: $1"
+            printf '%s\n' "$detail" >&2
+            printf '\n::error title=Orphan audit verification::%s\n' "$detail"
+            record_audit_failure "$detail" 'Read docs/ORPHAN-RUNBOOK.md and the archived audit record.'
+          }
+          audit_args=(--json)
+          destroy_mode=false
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DESTROY_INPUT" == "true" ]]; then
+            destroy_mode=true
+          fi
+
+          destroy_preflight_failure() {
+            local detail=$1 reason action
+            reason="Orphan audit destroy preflight failed: $detail The destroy pass did not run."
+            action='Read docs/ORPHAN-RUNBOOK.md and rerun the report-only audit.'
+            printf '%s\n' "$reason" >&2
+            printf '\n::error title=Orphan audit destroy preflight::%s\n' "$reason"
+            {
+              printf 'exit_code=2\ndestroy_mode=true\nsummary_assertion=not-run\nrepository_assertion=not-run\nrunner_scope_assertion=not-run\ngrace_assertion=not-run\norphan_count_assertion=not-run\nambiguous_count_assertion=not-run\nfinding_count_assertion=not-run\nexit_code_assertion=not-run\norphan_record_count=unavailable\nambiguous_record_count=unavailable\nfinding_record_count=unavailable\n'
+              printf 'failure_reason<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$reason"
+              printf 'failure_action<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$action"
+            } >> "$GITHUB_OUTPUT"
+            exit 2
+          }
+
+          # A real runner ignored every env override of a runner-defined GITHUB_* variable.
+          # Unsetting it here is the only route, so the audit must read wrangler.jsonc.
+          # GitHub Actions does not define GITHUB_RUNNER_SCOPE, so its env value applies.
+          # Keep GITHUB_RUNNER_SCOPE set for the audit.
+          unset GITHUB_REPOSITORY
+
+          if [[ "$destroy_mode" == 'true' ]]; then
+            report_exit_code=0
+            set +e
+            scripts/orphan-audit.sh --json \
+              >orphan-audit-report.jsonl 2>orphan-audit-report.stderr.log
+            report_exit_code=$?
+            set -e
+
+            cat orphan-audit-report.jsonl
+            cat orphan-audit-report.stderr.log >&2
+
+            report_records_json=''
+            report_summary_record=''
+            if [[ -s orphan-audit-report.jsonl ]]; then
+              if report_records_json=$(jq -sc \
+                '.' orphan-audit-report.jsonl 2>/dev/null); then
+                report_summary_record=$(jq -c \
+                  'map(select(type == "object" and .type == "summary")) | last // empty' \
+                  <<<"$report_records_json")
+              fi
+            fi
+            if [[ -z "$report_summary_record" ]]; then
+              destroy_preflight_failure \
+                'The report-only pass did not produce a summary record.'
+            fi
+            if ! jq -e --arg expected "$AUDIT_REPOSITORY" \
+              '.repository == $expected' >/dev/null <<<"$report_summary_record"; then
+              actual_repository=$(jq -c '.repository' <<<"$report_summary_record")
+              destroy_preflight_failure \
+                "The report-only summary repository must equal $AUDIT_REPOSITORY; received $actual_repository."
+            fi
+            if ! jq -e --arg expected "$AUDIT_RUNNER_SCOPE" \
+              '.runnerScope == $expected' >/dev/null <<<"$report_summary_record"; then
+              actual_runner_scope=$(jq -c '.runnerScope' <<<"$report_summary_record")
+              destroy_preflight_failure \
+                "The report-only summary runnerScope must equal $AUDIT_RUNNER_SCOPE; received $actual_runner_scope."
+            fi
+            if ! jq -e '.graceSeconds == 60' \
+              >/dev/null <<<"$report_summary_record"; then
+              actual_grace_seconds=$(jq -c '.graceSeconds' <<<"$report_summary_record")
+              destroy_preflight_failure \
+                "The report-only summary graceSeconds must equal 60; received $actual_grace_seconds."
+            fi
+            if [[ "$report_exit_code" -ne 0 && "$report_exit_code" -ne 1 ]]; then
+              destroy_preflight_failure \
+                "The report-only pass exited with code $report_exit_code."
+            fi
+
+            audit_args+=(--destroy)
+          fi
+
+          audit_exit_code=0
+          set +e
+          scripts/orphan-audit.sh "${audit_args[@]}" \
+            >orphan-audit.jsonl 2>orphan-audit.stderr.log
+          audit_exit_code=$?
+          set -e
+          exit_code=$audit_exit_code
+
+          cat orphan-audit.jsonl
+          cat orphan-audit.stderr.log >&2
+
+          repository_assertion='not-run'
+          runner_scope_assertion='not-run'
+          grace_assertion='not-run'
+          summary_assertion='not-run'
+          orphan_count_assertion='not-run'
+          ambiguous_count_assertion='not-run'
+          finding_count_assertion='not-run'
+          exit_code_assertion='not-run'
+          orphan_record_count='unavailable'
+          ambiguous_record_count='unavailable'
+          finding_record_count='unavailable'
+          records_json=''
+          summary_record=''
+          if [[ -s orphan-audit.jsonl ]]; then
+            if records_json=$(jq -sc '.' orphan-audit.jsonl 2>/dev/null); then
+              summary_record=$(jq -c \
+                'map(select(type == "object" and .type == "summary")) | last // empty' \
+                <<<"$records_json")
+              orphan_record_count=$(jq -r \
+                '[.[] | select(type == "object" and .type == "orphan")] | length' \
+                <<<"$records_json")
+              ambiguous_record_count=$(jq -r \
+                '[.[] | select(type == "object" and .type == "ambiguous-instance")] | length' \
+                <<<"$records_json")
+              finding_record_count=$((orphan_record_count + ambiguous_record_count))
+            fi
+          fi
+
+          # Audit exit codes 0, 1 and 3 must carry a summary record. Code 2 can
+          # occur before the audit writes one.
+          if [[ "$audit_exit_code" =~ ^[013]$ ]]; then
+            if [[ -n "$summary_record" ]]; then
+              summary_assertion='passed'
+            else
+              summary_assertion='failed'
+              exit_code=2
+              fail_check "The audit exited with code $audit_exit_code without a required summary record, so the fleet assertions could not run. The reported result is exit code 2."
+            fi
+          fi
+
+          if [[ -n "$summary_record" ]]; then
+            repository_assertion='passed'
+            runner_scope_assertion='passed'
+            grace_assertion='passed'
+            orphan_count_assertion='passed'
+            ambiguous_count_assertion='passed'
+            finding_count_assertion='passed'
+            exit_code_assertion='passed'
+
+            if ! jq -e --arg expected "$AUDIT_REPOSITORY" \
+              '.repository == $expected' >/dev/null <<<"$summary_record"; then
+              actual_repository=$(jq -c '.repository' <<<"$summary_record")
+              fail_check "summary repository must equal the preflight repository $AUDIT_REPOSITORY; received $actual_repository."
+              repository_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e --arg expected "$AUDIT_RUNNER_SCOPE" \
+              '.runnerScope == $expected' >/dev/null <<<"$summary_record"; then
+              actual_runner_scope=$(jq -c '.runnerScope' <<<"$summary_record")
+              fail_check "summary runnerScope must equal the preflight runner scope $AUDIT_RUNNER_SCOPE; received $actual_runner_scope."
+              runner_scope_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e '.graceSeconds == 60' \
+              >/dev/null <<<"$summary_record"; then
+              actual_grace_seconds=$(jq -c '.graceSeconds' <<<"$summary_record")
+              fail_check "summary graceSeconds must equal 60; received $actual_grace_seconds."
+              grace_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e --argjson expected "$orphan_record_count" \
+              '.orphanCount == $expected' >/dev/null <<<"$summary_record"; then
+              actual_orphan_count=$(jq -c '.orphanCount' <<<"$summary_record")
+              fail_check "summary orphanCount must equal the number of orphan records $orphan_record_count; received $actual_orphan_count."
+              orphan_count_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e --argjson expected "$ambiguous_record_count" \
+              '.ambiguousInstanceCount == $expected' \
+              >/dev/null <<<"$summary_record"; then
+              actual_ambiguous_count=$(jq -c \
+                '.ambiguousInstanceCount' <<<"$summary_record")
+              fail_check "summary ambiguousInstanceCount must equal the number of ambiguous-instance records $ambiguous_record_count; received $actual_ambiguous_count."
+              ambiguous_count_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e --argjson expected "$finding_record_count" \
+              '.findingCount == $expected' >/dev/null <<<"$summary_record"; then
+              actual_finding_count=$(jq -c '.findingCount' <<<"$summary_record")
+              fail_check "summary findingCount must equal the number of finding records $finding_record_count; received $actual_finding_count."
+              finding_count_assertion='failed'
+              exit_code=2
+            fi
+
+            if ! jq -e --argjson auditExitCode "$audit_exit_code" '
+              (.findingCount | type) == "number" and
+              (.findingCount | floor) == .findingCount and
+              .findingCount >= 0 and
+              .findingCount == (.orphanCount + .ambiguousInstanceCount) and
+              (($auditExitCode != 0) or .findingCount == 0) and
+              ((.findingCount == 0) or ($auditExitCode == 1 or $auditExitCode == 3))
+            ' >/dev/null 2>&1 <<<"$summary_record"; then
+              actual_finding_count=$(jq -c '.findingCount' <<<"$summary_record")
+              fail_check "audit exit code $audit_exit_code contradicts summary findingCount $actual_finding_count."
+              exit_code_assertion='failed'
+              exit_code=2
+            fi
+          fi
+
+          if [[ "$exit_code" == '2' && -z "$audit_failure_reason" ]]; then
+            record_audit_failure "The orphan audit script exited with operational code $audit_exit_code." 'Read the job log and the archived orphan-audit.stderr.log artifact.'
+          fi
+
+          {
+            printf 'exit_code=%s\ndestroy_mode=%s\nsummary_assertion=%s\nrepository_assertion=%s\nrunner_scope_assertion=%s\ngrace_assertion=%s\norphan_count_assertion=%s\nambiguous_count_assertion=%s\nfinding_count_assertion=%s\nexit_code_assertion=%s\norphan_record_count=%s\nambiguous_record_count=%s\nfinding_record_count=%s\n' \
+              "$exit_code" "$destroy_mode" "$summary_assertion" "$repository_assertion" "$runner_scope_assertion" "$grace_assertion" "$orphan_count_assertion" "$ambiguous_count_assertion" "$finding_count_assertion" "$exit_code_assertion" "$orphan_record_count" "$ambiguous_record_count" "$finding_record_count"
+            printf 'failure_reason<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$audit_failure_reason"
+            printf 'failure_action<<ORPHAN_AUDIT_EOF\n%s\nORPHAN_AUDIT_EOF\n' "$audit_failure_action"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the audit summary
+        if: always() && steps.audit.outcome != 'skipped'
+        shell: bash
+        env:
+          AUDIT_EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
+          DESTROY_MODE: ${{ steps.audit.outputs.destroy_mode }}
+          AUDIT_REPOSITORY: ${{ steps.preflight.outputs.audit_repository }}
+          AUDIT_RUNNER_SCOPE: ${{ steps.preflight.outputs.runner_scope }}
+          SUMMARY_ASSERTION: ${{ steps.audit.outputs.summary_assertion }}
+          REPOSITORY_ASSERTION: ${{ steps.audit.outputs.repository_assertion }}
+          RUNNER_SCOPE_ASSERTION: ${{ steps.audit.outputs.runner_scope_assertion }}
+          GRACE_ASSERTION: ${{ steps.audit.outputs.grace_assertion }}
+          ORPHAN_COUNT_ASSERTION: ${{ steps.audit.outputs.orphan_count_assertion }}
+          AMBIGUOUS_COUNT_ASSERTION: ${{ steps.audit.outputs.ambiguous_count_assertion }}
+          FINDING_COUNT_ASSERTION: ${{ steps.audit.outputs.finding_count_assertion }}
+          EXIT_CODE_ASSERTION: ${{ steps.audit.outputs.exit_code_assertion }}
+          ORPHAN_RECORD_COUNT: ${{ steps.audit.outputs.orphan_record_count }}
+          AMBIGUOUS_RECORD_COUNT: ${{ steps.audit.outputs.ambiguous_record_count }}
+          FINDING_RECORD_COUNT: ${{ steps.audit.outputs.finding_record_count }}
+          RUNBOOK_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/ORPHAN-RUNBOOK.md
+        run: |
+          set -euo pipefail
+          exit_code="${AUDIT_EXIT_CODE:-2}"
+          destroy_mode="${DESTROY_MODE:-false}"
+          case "$exit_code" in
+            0)
+              meaning='the audit found no findings'
+              ;;
+            1)
+              meaning='the audit found findings (orphans or ambiguous instances) and no destroy failed'
+              ;;
+            2)
+              meaning='the audit had an operational failure'
+              ;;
+            3)
+              meaning='the audit found findings (orphans or ambiguous instances) and at least one destroy failed'
+              ;;
+            *)
+              exit_code=2
+              meaning='the audit had an operational failure'
+              ;;
+          esac
+
+          {
+            printf '# Orphan audit: exit code \x60%s\x60 — %s\n\n' "$exit_code" "$meaning"
+            printf '**Destroy mode:** \x60%s\x60\n\n' "$destroy_mode"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          records_json=''
+          if [[ -s orphan-audit.jsonl ]]; then
+            if ! records_json=$(jq -sc '.' orphan-audit.jsonl 2>/dev/null); then
+              records_json=''
+            fi
+          fi
+          summary_record=''
+          if [[ -n "$records_json" ]]; then
+            summary_record=$(jq -c \
+              'map(select(type == "object" and .type == "summary")) | last // empty' \
+              <<<"$records_json")
+          fi
+
+          {
+            printf '## Audit assertions\n\n'
+            printf '| Assertion | Expected | Result |\n'
+            printf '| --- | --- | --- |\n'
+            printf '| Summary record exists for audit exit code \x600\x60, \x601\x60, or \x603\x60 | required | \x60%s\x60 |\n' \
+              "$SUMMARY_ASSERTION"
+            printf '| \x60repository\x60 equals preflight \x60audit_repository\x60 | \x60%s\x60 | \x60%s\x60 |\n' \
+              "$AUDIT_REPOSITORY" "$REPOSITORY_ASSERTION"
+            printf '| \x60runnerScope\x60 equals preflight \x60runner_scope\x60 | \x60%s\x60 | \x60%s\x60 |\n' \
+              "$AUDIT_RUNNER_SCOPE" "$RUNNER_SCOPE_ASSERTION"
+            printf '| \x60graceSeconds\x60 equals the policy value | \x6060\x60 | \x60%s\x60 |\n' \
+              "$GRACE_ASSERTION"
+            printf '| \x60orphanCount\x60 equals the orphan-record count | \x60%s\x60 | \x60%s\x60 |\n' \
+              "$ORPHAN_RECORD_COUNT" "$ORPHAN_COUNT_ASSERTION"
+            printf '| \x60ambiguousInstanceCount\x60 equals the ambiguous-instance record count | \x60%s\x60 | \x60%s\x60 |\n' \
+              "$AMBIGUOUS_RECORD_COUNT" "$AMBIGUOUS_COUNT_ASSERTION"
+            printf '| \x60findingCount\x60 equals the finding-record count | \x60%s\x60 | \x60%s\x60 |\n' \
+              "$FINDING_RECORD_COUNT" "$FINDING_COUNT_ASSERTION"
+            printf '| Audit exit code agrees with \x60findingCount\x60 | \x600\x60 requires zero; findings require \x601\x60 or \x603\x60 | \x60%s\x60 |\n\n' \
+              "$EXIT_CODE_ASSERTION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -z "$summary_record" ]]; then
+            {
+              printf '## Summary unavailable\n\n'
+              if [[ "$SUMMARY_ASSERTION" == 'failed' ]]; then
+                printf '> The audit did not produce a required summary record.\n\n'
+                printf '> The workflow reported exit code \x602\x60 because the fleet assertions could not run.\n\n'
+              else
+                printf '> The audit failed before it produced a summary.\n\n'
+              fi
+              printf '[Open \x60docs/ORPHAN-RUNBOOK.md\x60](%s)\n' "$RUNBOOK_URL"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! fleet_rows=$(jq -r '
+            def cell: if . == null then "null" else tostring end;
+            "| `repository` | `\(.repository | cell)` |\n" +
+            "| `runnerScope` | `\(.runnerScope | cell)` |\n" +
+            "| `containerName` | `\(.containerName | cell)` |\n" +
+            "| `applicationId` | `\(.applicationId | cell)` |\n" +
+            "| `graceSeconds` | `\(.graceSeconds | cell)` |"
+          ' <<<"$summary_record" 2>/dev/null); then
+            fleet_rows='| Summary fields | unavailable |'
+          fi
+          if ! counter_rows=$(jq -r '
+            def cell: if . == null then "null" else tostring end;
+            "| `orphanCount` | \(.orphanCount | cell) |\n" +
+            "| `ambiguousInstanceCount` | \(.ambiguousInstanceCount | cell) |\n" +
+            "| `findingCount` | \(.findingCount | cell) |\n" +
+            "| `destroyScheduledCount` | \(.destroyScheduledCount | cell) |\n" +
+            "| `destroyAlreadyScheduledCount` | \(.destroyAlreadyScheduledCount | cell) |\n" +
+            "| `destroyFailureCount` | \(.destroyFailureCount | cell) |\n" +
+            "| `destroySkippedCount` | \(.destroySkippedCount | cell) |\n" +
+            "| `destroyOperatorRequiredCount` | \(.destroyOperatorRequiredCount | cell) |\n" +
+            "| `destroyRegisteredSkipCount` | \(.destroyRegisteredSkipCount | cell) |"
+          ' <<<"$summary_record" 2>/dev/null); then
+            counter_rows='| Summary counters | unavailable |'
+          fi
+
+          {
+            printf '## Audited fleet\n\n'
+            printf '| Field | Value |\n'
+            printf '| --- | --- |\n'
+            printf '%s\n\n' "$fleet_rows"
+            printf '## Counters\n\n'
+            printf '| Counter | Value |\n'
+            printf '| --- | ---: |\n'
+            printf '%s\n\n' "$counter_rows"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ambiguous_rows=''
+          if ! ambiguous_rows=$(jq -r '
+            def cell:
+              if . == null then "null" else tostring end
+              | gsub("\\|"; "\\|")
+              | gsub("[\\r\\n]"; " ");
+            .[]
+            | select(type == "object" and .type == "ambiguous-instance")
+            | [
+                .sandboxId,
+                .instanceId,
+                .reason,
+                (.conflictingFields | join(", ")),
+                (.variants | tojson)
+              ]
+            | map(cell)
+            | "| `" + join("` | `") + "` |"
+          ' <<<"$records_json" 2>/dev/null); then
+            ambiguous_rows=''
+          fi
+          if [[ -n "$ambiguous_rows" ]]; then
+            {
+              printf '## Ambiguous instances\n\n'
+              printf '| \x60sandboxId\x60 | \x60instanceId\x60 | \x60reason\x60 | \x60conflictingFields\x60 | \x60variants\x60 |\n'
+              printf '| --- | --- | --- | --- | --- |\n'
+              printf '%s\n\n' "$ambiguous_rows"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## Ambiguous instances\n\nNo ambiguous instance records were produced.\n\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          orphan_rows=''
+          if ! orphan_rows=$(jq -r '
+            def cell:
+              if . == null then "null" else tostring end
+              | gsub("\\|"; "\\|")
+              | gsub("[\\r\\n]"; " ");
+            .[]
+            | select(type == "object" and .type == "orphan")
+            | [
+                .sandboxId,
+                .reason,
+                .state,
+                .ageSeconds,
+                .ageSource,
+                .registryState,
+                .destroyResult,
+                .destroyHttpStatus
+              ]
+            | map(cell)
+            | "| `" + join("` | `") + "` |"
+          ' <<<"$records_json" 2>/dev/null); then
+            orphan_rows=''
+          fi
+          if [[ -n "$orphan_rows" ]]; then
+            {
+              printf '## Orphans\n\n'
+              printf '| \x60sandboxId\x60 | \x60reason\x60 | \x60state\x60 | \x60ageSeconds\x60 | \x60ageSource\x60 | \x60registryState\x60 | \x60destroyResult\x60 | \x60destroyHttpStatus\x60 |\n'
+              printf '| --- | --- | --- | ---: | --- | --- | --- | ---: |\n'
+              printf '%s\n\n' "$orphan_rows"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## Orphans\n\nNo orphan records were produced.\n\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '[Open \x60docs/ORPHAN-RUNBOOK.md\x60](%s)\n' "$RUNBOOK_URL" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the audit record
+        if: always() && steps.audit.outcome != 'skipped'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: orphan-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            orphan-audit.jsonl
+            orphan-audit.stderr.log
+            orphan-audit-report.jsonl
+            orphan-audit-report.stderr.log
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Alert on the audit result
+        if: always()
+        shell: bash
+        env:
+          AUDIT_EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          PREFLIGHT_FAILURE_REASON: ${{ steps.preflight.outputs.failure_reason }}
+          PREFLIGHT_FAILURE_ACTION: ${{ steps.preflight.outputs.failure_action }}
+          AUDIT_FAILURE_REASON: ${{ steps.audit.outputs.failure_reason }}
+          AUDIT_FAILURE_ACTION: ${{ steps.audit.outputs.failure_action }}
+          SLACK_WEBHOOK_URL: ${{ secrets.ORPHAN_AUDIT_SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNBOOK_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/ORPHAN-RUNBOOK.md
+        run: |
+          set -euo pipefail
+          exit_code="${AUDIT_EXIT_CODE:-2}"
+          if [[ "$AUDIT_OUTCOME" == 'skipped' ]]; then
+            exit_code=2
+            if [[ "$PREFLIGHT_OUTCOME" == 'failure' ]]; then
+              meaning='the audit preflight failed'
+            else
+              meaning='the workflow failed before the audit ran'
+            fi
+          else
+            case "$exit_code" in
+              0)
+                if [[ "$JOB_STATUS" == 'success' ]]; then
+                  exit 0
+                fi
+                meaning='the workflow failed after a clean audit'
+                ;;
+              1)
+                # Findings alone are not an alert. The scheduled operator
+                # destroy workflow removes the orphan classes it can prove, and
+                # ambiguous instance records are a Cloudflare listing artifact
+                # that the audit quarantines. The job status, the step summary
+                # and the archived audit record still carry every finding.
+                # Slack hears only about a destroy failure or an operational
+                # failure.
+                exit 0
+                ;;
+              2)
+                meaning='the audit had an operational failure'
+                ;;
+              3)
+                meaning='the audit found findings (orphans or ambiguous instances) and at least one destroy failed'
+                ;;
+              *)
+                exit_code=2
+                meaning='the audit had an operational failure'
+                ;;
+            esac
+          fi
+
+          if [[ "$exit_code" == '1' || "$exit_code" == '3' ]]; then
+            alert_class='finding'
+          else
+            alert_class='operational'
+          fi
+
+          failure_reason=''
+          failure_action=''
+          if [[ "$AUDIT_OUTCOME" == 'skipped' ]]; then
+            failure_reason="${PREFLIGHT_FAILURE_REASON:-}"
+            failure_action="${PREFLIGHT_FAILURE_ACTION:-}"
+          else
+            failure_reason="${AUDIT_FAILURE_REASON:-}"
+            failure_action="${AUDIT_FAILURE_ACTION:-}"
+          fi
+          if [[ "$alert_class" == 'operational' ]]; then
+            if [[ -z "$failure_reason" ]]; then
+              failure_reason=$meaning
+            fi
+            if [[ -z "$failure_action" ]]; then
+              failure_action='Open the run log and read docs/ORPHAN-RUNBOOK.md.'
+            fi
+          elif [[ -z "$failure_action" ]]; then
+            failure_action='Follow "Triage a red hourly run" in docs/ORPHAN-RUNBOOK.md.'
+          fi
+
+          summary_record=''
+          if [[ -s orphan-audit.jsonl ]]; then
+            if records_json=$(jq -sc '.' orphan-audit.jsonl 2>/dev/null); then
+              summary_record=$(jq -c \
+                'map(select(type == "object" and .type == "summary")) | last // empty' \
+                <<<"$records_json")
+            fi
+          fi
+          orphan_count='unavailable'
+          ambiguous_instance_count='unavailable'
+          destroy_already_scheduled_count='unavailable'
+          destroy_failure_count='unavailable'
+          destroy_operator_required_count='unavailable'
+          repository='unavailable'
+          if [[ -n "$summary_record" ]]; then
+            if summary_values=$(jq -er '
+              [
+                .orphanCount,
+                .ambiguousInstanceCount,
+                .destroyAlreadyScheduledCount,
+                .destroyFailureCount,
+                .destroyOperatorRequiredCount,
+                .repository
+              ]
+              | map(if . == null then "unavailable" else tostring end)
+              | @tsv
+            ' <<<"$summary_record" 2>/dev/null); then
+              IFS=$'\t' read -r orphan_count ambiguous_instance_count \
+                destroy_already_scheduled_count destroy_failure_count \
+                destroy_operator_required_count repository <<<"$summary_values"
+            fi
+          fi
+
+          counters_json='null'
+          if [[ "$alert_class" == 'finding' ]]; then
+            counters_json=$(jq -n \
+              --arg orphanCount "$orphan_count" \
+              --arg ambiguousInstanceCount "$ambiguous_instance_count" \
+              --arg destroyAlreadyScheduledCount \
+                "$destroy_already_scheduled_count" \
+              --arg destroyFailureCount "$destroy_failure_count" \
+              --arg destroyOperatorRequiredCount \
+                "$destroy_operator_required_count" \
+              "{ \$orphanCount, \$ambiguousInstanceCount, \$destroyAlreadyScheduledCount, \$destroyFailureCount, \$destroyOperatorRequiredCount }")
+          fi
+
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            printf '\n::warning title=Orphan audit alert degraded::Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          case "$exit_code" in
+            1) header_text='Orphan audit: findings found'; color='#e8912d' ;;
+            3) header_text='Orphan audit: destroy failed'; color='#d13212' ;;
+            *) header_text='Orphan audit did not run'; color='#d13212' ;;
+          esac
+          if [[ "$alert_class" == 'operational' ]]; then
+            if [[ "$AUDIT_OUTCOME" == 'skipped' ]]; then
+              header_text='Orphan audit did not run'
+            else
+              header_text='Orphan audit: operational failure'
+            fi
+          fi
+
+          if [[ "$repository" == 'unavailable' ]]; then
+            printf -v context_text \
+              "exit code \`%s\` · <%s|Open the run> · <%s|Runbook>" \
+              "$exit_code" "$RUN_URL" "$RUNBOOK_URL"
+          else
+            printf -v context_text \
+              "exit code \`%s\` · repository \`%s\` · <%s|Open the run> · <%s|Runbook>" \
+              "$exit_code" "$repository" "$RUN_URL" "$RUNBOOK_URL"
+          fi
+          if [[ "$alert_class" == 'operational' ]]; then
+            first_failure_line=${failure_reason%%$'\n'*}
+            printf -v fallback 'Orphan audit exit code %s — %s' \
+              "$exit_code" "$first_failure_line"
+            printf -v cause_text '*Cause*\n%s' "$failure_reason"
+          else
+            printf -v fallback \
+              'Orphan audit exit code %s — %s (orphanCount %s, ambiguousInstanceCount %s, destroyFailureCount %s)' \
+              "$exit_code" "$meaning" "$orphan_count" \
+              "$ambiguous_instance_count" "$destroy_failure_count"
+            printf -v cause_text '*What happened*\n%s' "$meaning"
+            if [[ -n "$failure_reason" ]]; then
+              cause_text+=$'\n'
+              cause_text+="$failure_reason"
+            fi
+          fi
+          printf -v action_text '*Do this*\n%s' "$failure_action"
+
+          payload=$(jq -n \
+            --arg exitCode "$exit_code" \
+            --arg alertClass "$alert_class" \
+            --arg headerText "$header_text" \
+            --arg color "$color" \
+            --arg fallback "$fallback" \
+            --arg causeText "$cause_text" \
+            --arg actionText "$action_text" \
+            --arg contextText "$context_text" \
+            --argjson counters "$counters_json" '
+              {
+                text: $fallback,
+                attachments: [
+                  {
+                    color: $color,
+                    fallback: $fallback,
+                    blocks: (
+                      [
+                        {
+                          type: "header",
+                          text: {
+                            type: "plain_text",
+                            text: ($headerText | .[0:150])
+                          }
+                        },
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: ($causeText | .[0:3000])
+                          }
+                        }
+                      ]
+                      + (
+                        if $alertClass == "finding" then
+                          [
+                            {
+                              type: "section",
+                              fields: [
+                                {
+                                  type: "mrkdwn",
+                                  text: ("*orphanCount*\n\($counters.orphanCount)" | .[0:3000])
+                                },
+                                {
+                                  type: "mrkdwn",
+                                  text: ("*ambiguousInstanceCount*\n\($counters.ambiguousInstanceCount)" | .[0:3000])
+                                },
+                                {
+                                  type: "mrkdwn",
+                                  text: ("*destroyAlreadyScheduledCount*\n\($counters.destroyAlreadyScheduledCount)" | .[0:3000])
+                                },
+                                {
+                                  type: "mrkdwn",
+                                  text: ("*destroyFailureCount*\n\($counters.destroyFailureCount)" | .[0:3000])
+                                },
+                                {
+                                  type: "mrkdwn",
+                                  text: ("*destroyOperatorRequiredCount*\n\($counters.destroyOperatorRequiredCount)" | .[0:3000])
+                                }
+                              ]
+                            }
+                          ]
+                        else
+                          []
+                        end
+                      )
+                      + [
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: ($actionText | .[0:3000])
+                          }
+                        },
+                        {
+                          type: "context",
+                          elements: [
+                            {
+                              type: "mrkdwn",
+                              text: ($contextText | .[0:3000])
+                            }
+                          ]
+                        }
+                      ]
+                    )
+                  }
+                ]
+              }
+            ')
+          slack_response=''
+          if ! slack_response=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"); then
+            if [[ -n "$slack_response" ]]; then
+              printf '%s\n' "$slack_response" >&2
+            fi
+            printf '\n::error title=Orphan audit Slack delivery::Slack delivery failed. Use the workflow result and archived audit record.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery failed. Use the workflow result and archived audit record.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set the audit result
+        if: always() && steps.audit.outcome != 'skipped'
+        shell: bash
+        env:
+          AUDIT_EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          exit_code="${AUDIT_EXIT_CODE:-2}"
+          case "$exit_code" in
+            0 | 1 | 2 | 3)
+              exit "$exit_code"
+              ;;
+            *)
+              printf 'The audit did not produce a valid exit code.\n' >&2
+              exit 2
+              ;;
+          esac

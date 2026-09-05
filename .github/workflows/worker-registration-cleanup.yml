@@ -1,0 +1,262 @@
+name: Worker registration cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Delete selected registrations. False reports only.
+        type: boolean
+        default: false
+      confirm:
+        description: Type DELETE to authorise an apply run.
+        type: string
+        default: ''
+      limit:
+        description: Maximum registrations to delete in each Worker call.
+        type: string
+        default: '50'
+      rounds:
+        description: Maximum number of bounded Worker calls.
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency: { group: worker-registration-cleanup, cancel-in-progress: false }
+
+env:
+  WORKER_URL: ${{ vars.WORKER_URL }}
+  CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+
+jobs:
+  cleanup:
+    name: Clean runner registrations through the Worker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Forty rounds at the 180-second per-call ceiling need 120 minutes. This
+    # bound adds 30 minutes for the baseline call, checkout, jq and step overhead.
+    timeout-minutes: 150
+    steps:
+      - name: Preflight the cleanup configuration
+        shell: bash
+        env:
+          APPLY_INPUT: ${{ inputs.apply }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          LIMIT_INPUT: ${{ inputs.limit }}
+          ROUNDS_INPUT: ${{ inputs.rounds }}
+        run: |
+          set -euo pipefail
+
+          settings_path='Settings → Secrets and variables → Actions'
+          positive_integer_pattern='^[1-9][0-9]*$'
+          max_deletes=50
+          max_rounds=40
+          if [[ -z "$WORKER_URL" || "$WORKER_URL" != https://* ]]; then
+            printf '::error title=Invalid Worker URL::Set WORKER_URL to an HTTPS URL at %s.\n' \
+              "$settings_path"
+            exit 1
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            printf '::error title=Missing control token::Set CONTROL_TOKEN at %s.\n' \
+              "$settings_path"
+            exit 1
+          fi
+          if [[ ! "$LIMIT_INPUT" =~ $positive_integer_pattern ]]; then
+            printf '::error title=Invalid limit::Input limit must be a positive decimal integer.\n'
+            exit 1
+          fi
+          if (( ${#LIMIT_INPUT} > ${#max_deletes} )) ||
+             (( 10#$LIMIT_INPUT > max_deletes )); then
+            printf '::error title=Invalid limit::Input limit must not exceed 50.\n'
+            exit 1
+          fi
+          if [[ ! "$ROUNDS_INPUT" =~ $positive_integer_pattern ]]; then
+            printf '::error title=Invalid rounds::Input rounds must be a positive decimal integer.\n'
+            exit 1
+          fi
+          if (( ${#ROUNDS_INPUT} > ${#max_rounds} )) ||
+             (( 10#$ROUNDS_INPUT > max_rounds )); then
+            printf '::error title=Invalid rounds::Input rounds must not exceed 40.\n'
+            exit 1
+          fi
+          if [[ "$APPLY_INPUT" == 'true' && "$CONFIRM_INPUT" != 'DELETE' ]]; then
+            printf '::error title=Missing confirmation::An apply run requires the literal DELETE confirmation.\n'
+            exit 1
+          fi
+
+      - name: Run the Worker registration cleanup
+        shell: bash
+        env:
+          APPLY_INPUT: ${{ inputs.apply }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          LIMIT_INPUT: ${{ inputs.limit }}
+          ROUNDS_INPUT: ${{ inputs.rounds }}
+        run: |
+          set -euo pipefail
+
+          worker_url=${WORKER_URL%/}
+          report_path='worker-registration-cleanup-report.json'
+          umask 077
+          file=$(mktemp "$RUNNER_TEMP/worker-registration-cleanup.XXXXXX")
+          trap 'rm -f -- "$file"' EXIT
+
+          write_round_summary() {
+            local report_file=$1
+            local round=$2
+            {
+              printf '## Worker registration cleanup round %s\n\n' "$round"
+              printf '| Field | Value |\n'
+              printf '| --- | ---: |\n'
+              jq -r '
+                "| Scope | \(.scope) |",
+                "| Apply | \(.apply) |",
+                "| Refused | \(.refused) |",
+                "| Refusal reason | \(.refusalReason // "none") |",
+                "| Total registrations | \(.totalRegistrations // "unknown") |",
+                "| Filtered registrations | \(.filteredRegistrations // "unknown") |",
+                "| Expected targets | \(.expectedTargets // "none") |",
+                "| Delete targets | \(.deleteTargets // "unknown") |",
+                "| Attempted | \(.attempted) |",
+                "| Deleted | \(.deleted) |",
+                "| Already absent | \(.alreadyAbsent) |",
+                "| Busy skipped | \(.busySkipped) |",
+                "| Remaining | \(.remaining // "unknown") |"
+              ' "$report_file"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          report_has_cleanup_shape() {
+            local report_file=$1
+            jq -e '
+              type == "object"
+              and has("scope")
+              and has("apply")
+              and has("refused")
+              and has("refusalReason")
+              and has("totalRegistrations")
+              and has("filteredRegistrations")
+              and has("expectedTargets")
+              and has("deleteTargets")
+              and has("attempted")
+              and has("deleted")
+              and has("alreadyAbsent")
+              and has("busySkipped")
+              and has("remaining")
+            ' >/dev/null "$report_file"
+          }
+
+          run_cleanup_call() {
+            local request_body=$1
+            local round=$2
+            local curl_status=0
+            local http_status
+            http_status=$(
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 180 \
+                --request POST \
+                --header "Authorization: Bearer $CONTROL_TOKEN" \
+                --header 'Content-Type: application/json' \
+                --data "$request_body" \
+                --output "$file" \
+                --write-out '%{http_code}' \
+                "$worker_url/operator/registrations/cleanup"
+            ) || curl_status=$?
+            cp -- "$file" "$report_path"
+
+            if report_has_cleanup_shape "$file" 2>/dev/null; then
+              write_round_summary "$file" "$round"
+            fi
+
+            if (( curl_status != 0 )) ||
+               [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              printf 'Worker registration cleanup response body:\n' >&2
+              if [[ -s "$file" ]]; then
+                cat "$file" >&2
+                printf '\n' >&2
+              else
+                printf '(empty response body)\n' >&2
+              fi
+              printf 'Worker registration cleanup HTTP status: %s\n' \
+                "$http_status" >&2
+              if (( curl_status != 0 )); then
+                exit "$curl_status"
+              fi
+              exit 1
+            fi
+
+            report_has_cleanup_shape "$file"
+          }
+
+          expected_targets=''
+          if [[ "$APPLY_INPUT" == 'true' ]]; then
+            request_body=$(jq -n \
+              --argjson apply false \
+              --arg confirm '' \
+              --argjson limit "$LIMIT_INPUT" \
+              '{ apply: $apply, confirm: $confirm, limit: $limit }')
+            run_cleanup_call "$request_body" 'baseline'
+            if ! expected_targets=$(jq -er '
+              select(.filteredRegistrations | type == "number")
+              | .filteredRegistrations
+            ' "$file"); then
+              printf '::error title=Invalid cleanup report::The baseline filteredRegistrations value must be a number.\n'
+              exit 1
+            fi
+          fi
+
+          for (( round=1; round<=ROUNDS_INPUT; round+=1 )); do
+            if [[ "$APPLY_INPUT" == 'true' ]]; then
+              request_body=$(jq -n \
+                --argjson apply true \
+                --arg confirm "$CONFIRM_INPUT" \
+                --argjson limit "$LIMIT_INPUT" \
+                --argjson expectedTargets "$expected_targets" \
+                '{
+                  apply: $apply,
+                  confirm: $confirm,
+                  limit: $limit,
+                  expectedTargets: $expectedTargets
+                }')
+            else
+              request_body=$(jq -n \
+                --argjson apply false \
+                --arg confirm "$CONFIRM_INPUT" \
+                --argjson limit "$LIMIT_INPUT" \
+                '{ apply: $apply, confirm: $confirm, limit: $limit }')
+            fi
+            run_cleanup_call "$request_body" "$round"
+            if [[ "$APPLY_INPUT" != 'true' ]]; then
+              break
+            fi
+            if jq -e '.refused == true' >/dev/null "$file"; then
+              break
+            fi
+            if jq -e '.remaining == 0' >/dev/null "$file"; then
+              break
+            fi
+            # Predict the NEXT round's population, not its deletable count.
+            # `remaining` excludes busy records but `filteredRegistrations`
+            # includes them, so handing off `remaining` would under-predict by
+            # the busy count and refuse the next round as false growth.
+            if ! expected_targets=$(jq -er '
+              select(
+                (.filteredRegistrations | type == "number")
+                and (.deleted | type == "number")
+                and (.alreadyAbsent | type == "number")
+              )
+              | .filteredRegistrations - .deleted - .alreadyAbsent
+            ' "$file"); then
+              printf '::error title=Invalid cleanup report::The cleanup report must carry numeric filteredRegistrations, deleted and alreadyAbsent values.\n'
+              exit 1
+            fi
+          done
+
+      - name: Upload the last cleanup report
+        if: always() && hashFiles('worker-registration-cleanup-report.json') != ''
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: worker-registration-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: worker-registration-cleanup-report.json

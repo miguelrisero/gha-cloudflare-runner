@@ -1,0 +1,30 @@
+{
+  "name": "gha-cloudflare-runner",
+  "version": "0.1.0",
+  "description": "Ephemeral GitHub Actions runners in Cloudflare Sandbox containers, via the runner scale set protocol.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miguelrisero/gha-cloudflare-runner.git"
+  },
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "wrangler deploy --dry-run --containers-rollout=none",
+    "check:outage-gate": "wrangler deploy --dry-run --config outage-gate/wrangler.jsonc",
+    "deploy": "scripts/deploy.sh",
+    "dev": "wrangler dev",
+    "lint": "eslint src test scripts outage-gate",
+    "pretest": "node -e \"const { globSync } = require('node:fs'); if (globSync('test/**/*.test.js').length === 0) { console.error('No test files found'); process.exit(1); }\"",
+    "test": "node --test --test-concurrency=5 'test/**/*.test.js'"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "eslint": "^9.35.0",
+    "globals": "^16.0.0",
+    "wrangler": "4.124.0"
+  }
+}

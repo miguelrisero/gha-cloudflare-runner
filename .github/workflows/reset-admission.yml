@@ -1,0 +1,128 @@
+name: Reset admission limit
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale_set:
+        description: The scale set name to reset.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    name: Reset and prove the admission limit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Reset the learned admission limit
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ inputs.scale_set }}
+        run: |
+          set -euo pipefail
+
+          settings_path='Settings → Secrets and variables → Actions'
+          scale_set_pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+          if [[ -z "$WORKER_URL" || "$WORKER_URL" != https://* ]]; then
+            printf '::error title=Invalid Worker URL::Set WORKER_URL to an HTTPS URL at %s.\n' \
+              "$settings_path"
+            exit 1
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            printf '::error title=Missing control token::Set CONTROL_TOKEN at %s.\n' \
+              "$settings_path"
+            exit 1
+          fi
+          if [[ ! "$SCALE_SET" =~ $scale_set_pattern ]]; then
+            printf '::error title=Invalid scale set::Input scale_set must match the Worker scale set name pattern.\n'
+            exit 1
+          fi
+
+          worker_url=${WORKER_URL%/}
+          encoded_scale_set=$(jq -nr --arg value "$SCALE_SET" '$value | @uri')
+          listener_url="$worker_url/autopilot/listener/$encoded_scale_set"
+          umask 077
+          before_file=$(mktemp "$RUNNER_TEMP/reset-admission-before.XXXXXX")
+          reset_file=$(mktemp "$RUNNER_TEMP/reset-admission-result.XXXXXX")
+          after_file=$(mktemp "$RUNNER_TEMP/reset-admission-after.XXXXXX")
+          trap 'rm -f -- "$before_file" "$reset_file" "$after_file"' EXIT
+
+          request_listener() {
+            local label=$1
+            local method=$2
+            local url=$3
+            local output_file=$4
+            local curl_status=0
+            local http_status
+
+            http_status=$(
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --retry 3 \
+                --retry-all-errors \
+                --request "$method" \
+                --header "Authorization: Bearer $CONTROL_TOKEN" \
+                --output "$output_file" \
+                --write-out '%{http_code}' \
+                "$url"
+            ) || curl_status=$?
+
+            if (( curl_status != 0 )) || [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              printf '%s response body:\n' "$label" >&2
+              if [[ -s "$output_file" ]]; then
+                cat "$output_file" >&2
+                printf '\n' >&2
+              else
+                printf '(empty response body)\n' >&2
+              fi
+              printf '%s HTTP status: %s\n' "$label" "$http_status" >&2
+              if (( curl_status != 0 )); then
+                return "$curl_status"
+              fi
+              return 1
+            fi
+          }
+
+          request_listener 'Before status' GET "$listener_url" "$before_file"
+          request_listener \
+            'Admission reset' \
+            POST \
+            "$listener_url/reset-admission" \
+            "$reset_file"
+          request_listener 'After status' GET "$listener_url" "$after_file"
+
+          jq -e '
+            type == "object"
+            and has("admissionLimit")
+            and (.admissionLimit == null or (.admissionLimit | type) == "number")
+          ' >/dev/null "$before_file"
+          jq -e '
+            type == "object"
+            and .reset == true
+            and has("previousLimit")
+            and (.previousLimit == null or (.previousLimit | type) == "number")
+            and .admissionLimit == null
+          ' >/dev/null "$reset_file"
+          jq -e '
+            type == "object"
+            and has("admissionLimit")
+            and (.admissionLimit == null or (.admissionLimit | type) == "number")
+          ' >/dev/null "$after_file"
+
+          before_limit=$(jq -r '.admissionLimit | if . == null then "null" else tostring end' "$before_file")
+          previous_limit=$(jq -r '.previousLimit | if . == null then "null" else tostring end' "$reset_file")
+          after_limit=$(jq -r '.admissionLimit | if . == null then "null" else tostring end' "$after_file")
+
+          {
+            printf '## Admission limit reset proof\n\n'
+            printf '**Before admissionLimit: %s**\n\n' "$before_limit"
+            printf '**Reset previousLimit: %s**\n\n' "$previous_limit"
+            printf '**After admissionLimit: %s**\n' "$after_limit"
+          } >> "$GITHUB_STEP_SUMMARY"

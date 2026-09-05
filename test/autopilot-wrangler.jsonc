@@ -1,0 +1,31 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "autopilot-control-regression-test",
+  "main": "autopilot-harness.js",
+  "compatibility_date": "2026-08-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "CONTROL_TOKEN": "control-token-with-at-least-32-characters",
+    "GITHUB_REPOSITORY": "example/runner-test",
+    "GITHUB_TOKEN": "github-token",
+    "RUNNER_LABELS": "cloudflare-sandbox"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AutopilotControl",
+        "class_name": "AutopilotControl"
+      },
+      {
+        "name": "RunnerRegistry",
+        "class_name": "RunnerRegistry"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AutopilotControl", "RunnerRegistry"]
+    }
+  ]
+}

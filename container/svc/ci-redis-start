@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Start a throwaway Redis as the unprivileged runner user.
+# This uses the baked Redis installation instead of the runner's Docker daemon.
+# The command blocks until Redis answers PING.
+# Usage: ci-redis-start --port 6379
+set -euo pipefail
+PORT=6379
+if [ $# -gt 0 ]; then
+  if [ "$1" = "--port" ]; then PORT="${2:?ci-redis-start: --port needs a value}"
+  else echo "ci-redis-start: unknown arg '$1' (use: --port N)" >&2; exit 2; fi
+fi
+
+redis-server --port "$PORT" --bind 127.0.0.1 --daemonize yes --save '' --appendonly no \
+  --dir "$(mktemp -d "${TMPDIR:-/tmp}/ci-redis.XXXXXX")" >/dev/null
+
+for _ in $(seq 1 20); do
+  [ "$(redis-cli -h 127.0.0.1 -p "$PORT" ping 2>/dev/null)" = "PONG" ] && break
+  sleep 0.5
+done
+[ "$(redis-cli -h 127.0.0.1 -p "$PORT" ping 2>/dev/null)" = "PONG" ] \
+  || { echo "ci-redis-start: redis not ready" >&2; exit 1; }
+echo "ci-redis-start: redis up on 127.0.0.1:${PORT}"

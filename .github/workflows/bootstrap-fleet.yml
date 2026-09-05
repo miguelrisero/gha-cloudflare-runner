@@ -1,0 +1,469 @@
+# This workflow can only apply a capacity that the owner personally signed.
+# The Worker verifies the payload against CAPACITY_APPROVAL_PUBLIC_KEY.
+# The private key never leaves the owner's machine. It must never become a secret or an input.
+name: Bootstrap fleet
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale_set:
+        description: The scale set name to resume.
+        required: true
+        type: string
+      capacity_approval:
+        description: The signed capacity-approval JSON from scripts/sign-capacity-approval.sh.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-fleet
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Apply approval and resume listener
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # All curl attempts have a combined maximum of 538 seconds, including retry delays.
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Preflight the fleet configuration
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ inputs.scale_set }}
+          CAPACITY_APPROVAL: ${{ inputs.capacity_approval }}
+        run: |
+          set -euo pipefail
+
+          mask_value() {
+            local value=$1
+            value=${value//%/%25}
+            value=${value//$'\r'/%0D}
+            value=${value//$'\n'/%0A}
+            printf '::add-mask::%s\n' "$value"
+          }
+
+          # Mask the complete input before parsing it or printing any validation result.
+          if [[ -n "$CAPACITY_APPROVAL" ]]; then
+            mask_value "$CAPACITY_APPROVAL"
+          fi
+          approval_signature=$(
+            jq -r '
+              if type == "object" and (.signature | type) == "string"
+              then .signature
+              else empty
+              end
+            ' <<<"$CAPACITY_APPROVAL" 2>/dev/null || :
+          )
+          if [[ -n "$approval_signature" ]]; then
+            mask_value "$approval_signature"
+          fi
+
+          settings_path='Settings → Secrets and variables → Actions'
+          problems=()
+          scale_set_pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+
+          if [[ -z "$WORKER_URL" ]]; then
+            problems+=("Repository variable WORKER_URL is missing. Create it at $settings_path.")
+          elif [[ "$WORKER_URL" != https://* ]]; then
+            problems+=("Repository variable WORKER_URL must begin with https://. Update it at $settings_path.")
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            problems+=("Repository secret CONTROL_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ ! "$SCALE_SET" =~ $scale_set_pattern ]]; then
+            problems+=("Input scale_set must match the Worker scale set name pattern.")
+          fi
+
+          if ! approval_type=$(jq -r 'type' <<<"$CAPACITY_APPROVAL" 2>/dev/null); then
+            problems+=("Input capacity_approval must contain valid JSON.")
+          elif [[ "$approval_type" != object ]]; then
+            problems+=("Input capacity_approval must be a JSON object.")
+          else
+            if ! jq -e '
+              keys == ["approvedBy", "capacity", "effectiveAtMs", "signature"]
+            ' >/dev/null 2>&1 <<<"$CAPACITY_APPROVAL"; then
+              problems+=("Input capacity_approval must contain exactly approvedBy, capacity, effectiveAtMs, and signature.")
+            fi
+            if ! jq -e '
+              (.capacity | type) == "number"
+              and (.capacity >= 0)
+              and (.capacity == (.capacity | floor))
+            ' >/dev/null 2>&1 <<<"$CAPACITY_APPROVAL"; then
+              problems+=("Input capacity_approval capacity must be a non-negative integer.")
+            fi
+            if ! jq -e '
+              (.effectiveAtMs | type) == "number"
+              and (.effectiveAtMs >= 0)
+              and (.effectiveAtMs == (.effectiveAtMs | floor))
+            ' >/dev/null 2>&1 <<<"$CAPACITY_APPROVAL"; then
+              problems+=("Input capacity_approval effectiveAtMs must be a non-negative integer.")
+            fi
+            if ! jq -e '
+              (.approvedBy | type) == "string" and (.approvedBy | length) > 0
+            ' >/dev/null 2>&1 <<<"$CAPACITY_APPROVAL"; then
+              problems+=("Input capacity_approval approvedBy must be a non-empty string.")
+            fi
+            if ! jq -e '
+              (.signature | type) == "string" and (.signature | length) > 0
+            ' >/dev/null 2>&1 <<<"$CAPACITY_APPROVAL"; then
+              problems+=("Input capacity_approval signature must be a non-empty string.")
+            fi
+          fi
+
+          if (( ${#problems[@]} > 0 )); then
+            {
+              printf 'Fleet bootstrap preflight failed. Fix every item below.\n'
+              printf -- '- %s\n' "${problems[@]}"
+              printf 'Read docs/AUTOPILOT-OPERATIONS.md.\n'
+            } >&2
+            printf '\n::error title=Fleet bootstrap preflight::Fix every listed item at %s. Read docs/AUTOPILOT-OPERATIONS.md.\n' \
+              "$settings_path"
+            exit 1
+          fi
+
+      - name: Preflight the scale set
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ inputs.scale_set }}
+        run: |
+          set -euo pipefail
+          worker_url=${WORKER_URL%/}
+          encoded_scale_set=$(jq -nr --arg value "$SCALE_SET" '$value | @uri')
+          umask 077
+          response_file=$(mktemp "$RUNNER_TEMP/bootstrap-scale-set-status.XXXXXX")
+          trap 'rm -f -- "$response_file"' EXIT
+
+          curl_status=0
+          http_status=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-all-errors \
+              --request GET \
+              --header "Authorization: Bearer $CONTROL_TOKEN" \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "$worker_url/autopilot/listener/$encoded_scale_set"
+          ) || curl_status=$?
+
+          if (( curl_status != 0 )) || [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+            printf '::error title=Scale set preflight::Read the listener status before bootstrap. Check WORKER_URL and CONTROL_TOKEN. Read docs/AUTOPILOT-OPERATIONS.md.\n'
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' >/dev/null 2>&1 "$response_file"; then
+            printf '::error title=Scale set preflight::The listener returned an invalid status. Read docs/AUTOPILOT-OPERATIONS.md and run scripts/preflight-scale-set.sh.\n'
+            exit 1
+          fi
+
+          listener_configured=$(jq -r \
+            'if .configured == true then "true" else "false" end' \
+            "$response_file")
+          stopped_for_missing_scale_set=$(jq -r '
+            if (.stoppedReason | type) == "string"
+            then (.stoppedReason | contains("scale-set-not-found"))
+            else false
+            end
+          ' "$response_file")
+          missing_scale_set_exhausted=$(jq -r '
+            if (.exhaustionMarkers | type) == "array" then
+              any(
+                .exhaustionMarkers[]?;
+                . == "scale-set-not-found-exhausted"
+              )
+            else false
+            end
+          ' "$response_file")
+
+          if [[ "$listener_configured" != true \
+            || "$stopped_for_missing_scale_set" == true \
+            || "$missing_scale_set_exhausted" == true ]]; then
+            printf '::error title=Runner scale set prerequisite missing::Create the runner scale set named %s in its configured GitHub runner group. Configure AUTOPILOT_SCALE_SETS for that scale set. Read docs/AUTOPILOT-OPERATIONS.md and run scripts/preflight-scale-set.sh.\n' \
+              "$SCALE_SET"
+            exit 1
+          fi
+
+          printf 'The listener status has no runner scale set prerequisite error.\n'
+
+      - name: Apply the signed capacity approval
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          CAPACITY_APPROVAL: ${{ inputs.capacity_approval }}
+        run: |
+          set -euo pipefail
+          worker_url=${WORKER_URL%/}
+          approval_file="$RUNNER_TEMP/bootstrap-fleet-capacity-approval.json"
+          umask 077
+          response_file=$(mktemp "$RUNNER_TEMP/bootstrap-capacity-response.XXXXXX")
+          trap 'rm -f -- "$approval_file" "$response_file"' EXIT
+
+          # Keep the approval payload out of the process list and the curl command line.
+          printf '%s' "$CAPACITY_APPROVAL" > "$approval_file"
+
+          curl_status=0
+          http_status=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --request POST \
+              --header "Authorization: Bearer $CONTROL_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data-binary "@$approval_file" \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "$worker_url/autopilot/control/capacity"
+          ) || curl_status=$?
+
+          printf 'Capacity response body:\n'
+          if [[ -s "$response_file" ]]; then
+            cat "$response_file"
+            printf '\n'
+          else
+            printf '(empty response body)\n'
+          fi
+          printf 'Capacity HTTP status: %s\n' "$http_status"
+
+          if (( curl_status != 0 )); then
+            exit "$curl_status"
+          fi
+          if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+            exit 1
+          fi
+
+      - name: Resume the scale set listener
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ inputs.scale_set }}
+        run: |
+          set -euo pipefail
+          worker_url=${WORKER_URL%/}
+          encoded_scale_set=$(jq -nr --arg value "$SCALE_SET" '$value | @uri')
+          umask 077
+          response_file=$(mktemp "$RUNNER_TEMP/bootstrap-resume-response.XXXXXX")
+          trap 'rm -f -- "$response_file"' EXIT
+
+          # Resume is idempotent. Transport retries cannot apply a different state.
+          curl_status=0
+          http_status=$(
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-all-errors \
+              --request POST \
+              --header "Authorization: Bearer $CONTROL_TOKEN" \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "$worker_url/autopilot/listener/$encoded_scale_set/resume"
+          ) || curl_status=$?
+
+          printf 'Resume response body:\n'
+          if [[ -s "$response_file" ]]; then
+            cat "$response_file"
+            printf '\n'
+          else
+            printf '(empty response body)\n'
+          fi
+          printf 'Resume HTTP status: %s\n' "$http_status"
+
+          if (( curl_status != 0 )); then
+            exit "$curl_status"
+          fi
+          if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+            exit 1
+          fi
+
+      - name: Report the armed fleet state
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ inputs.scale_set }}
+        run: |
+          set -euo pipefail
+          worker_url=${WORKER_URL%/}
+          encoded_scale_set=$(jq -nr --arg value "$SCALE_SET" '$value | @uri')
+          umask 077
+          listener_file=$(mktemp "$RUNNER_TEMP/bootstrap-listener-status.XXXXXX")
+          control_file=$(mktemp "$RUNNER_TEMP/bootstrap-control-status.XXXXXX")
+          trap 'rm -f -- "$listener_file" "$control_file"' EXIT
+
+          get_status() {
+            local label=$1
+            local url=$2
+            local output_file=$3
+            local curl_status=0
+            local http_status
+
+            http_status=$(
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --retry 3 \
+                --retry-all-errors \
+                --request GET \
+                --header "Authorization: Bearer $CONTROL_TOKEN" \
+                --output "$output_file" \
+                --write-out '%{http_code}' \
+                "$url"
+            ) || curl_status=$?
+
+            if (( curl_status != 0 )) || [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              printf '%s response body:\n' "$label" >&2
+              if [[ -s "$output_file" ]]; then
+                cat "$output_file" >&2
+                printf '\n' >&2
+              else
+                printf '(empty response body)\n' >&2
+              fi
+              printf '%s HTTP status: %s\n' "$label" "$http_status" >&2
+              if (( curl_status != 0 )); then
+                return "$curl_status"
+              fi
+              return 1
+            fi
+            printf '%s HTTP status: %s\n' "$label" "$http_status"
+          }
+
+          get_status \
+            'Listener status' \
+            "$worker_url/autopilot/listener/$encoded_scale_set" \
+            "$listener_file"
+          get_status \
+            'Control status' \
+            "$worker_url/autopilot/control" \
+            "$control_file"
+
+          listener_projection=$(jq -cer '
+            if type != "object" then error("listener status must be an object")
+            else {
+              mode,
+              enabled,
+              configured,
+              advertisedMaxCapacity,
+              alarmGeneration,
+              heartbeatAgeMs,
+              sessionIdPresent
+            }
+            end
+          ' "$listener_file")
+          control_projection=$(jq -cer '
+            if type != "object" then error("control status must be an object")
+            else {
+              localGate,
+              approvedCapacity,
+              maxCapacity,
+              liveReservationCount
+            }
+            end
+          ' "$control_file")
+          printf 'Listener status: %s\n' "$listener_projection"
+          printf 'Control status: %s\n' "$control_projection"
+
+          IFS=$'\t' read -r \
+            listener_mode \
+            listener_enabled \
+            listener_configured \
+            listener_capacity \
+            listener_generation \
+            listener_heartbeat_age \
+            listener_session_present < <(
+              jq -er '
+                [
+                  .mode,
+                  .enabled,
+                  .configured,
+                  .advertisedMaxCapacity,
+                  .alarmGeneration,
+                  .heartbeatAgeMs,
+                  .sessionIdPresent
+                ]
+                | map(if . == null then "null" else tostring end)
+                | @tsv
+              ' "$listener_file"
+            )
+          IFS=$'\t' read -r \
+            control_gate \
+            control_approved_capacity \
+            control_max_capacity \
+            control_reservations < <(
+              jq -er '
+                [
+                  .localGate,
+                  .approvedCapacity,
+                  .maxCapacity,
+                  .liveReservationCount
+                ]
+                | map(if . == null then "null" else tostring end)
+                | @tsv
+              ' "$control_file"
+            )
+
+          {
+            printf '### Fleet bootstrap status\n\n'
+            printf '| Component | Field | Value |\n'
+            printf '| --- | --- | --- |\n'
+            printf "| Listener | mode | \`%s\` |\n" "$listener_mode"
+            printf "| Listener | enabled | \`%s\` |\n" "$listener_enabled"
+            printf "| Listener | configured | \`%s\` |\n" "$listener_configured"
+            printf "| Listener | advertisedMaxCapacity | \`%s\` |\n" "$listener_capacity"
+            printf "| Listener | alarmGeneration | \`%s\` |\n" "$listener_generation"
+            printf "| Listener | heartbeatAgeMs | \`%s\` |\n" "$listener_heartbeat_age"
+            printf "| Listener | sessionIdPresent | \`%s\` |\n" "$listener_session_present"
+            printf "| Control | localGate | \`%s\` |\n" "$control_gate"
+            printf "| Control | approvedCapacity | \`%s\` |\n" "$control_approved_capacity"
+            printf "| Control | maxCapacity | \`%s\` |\n" "$control_max_capacity"
+            printf "| Control | liveReservationCount | \`%s\` |\n" "$control_reservations"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          fleet_armed=true
+          if [[ "$listener_enabled" != true ]]; then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::enabled is false. Set AUTOPILOT_ENABLED to 1 and deploy again.\n'
+          fi
+          if [[ "$listener_configured" != true ]]; then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::configured is false. Set AUTOPILOT_SCALE_SETS for this scale set and deploy again.\n'
+          fi
+          if [[ "$listener_mode" != running ]]; then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::mode is not running. Inspect the resume response and listener status.\n'
+          fi
+          if [[ "$listener_mode" == running && "$listener_capacity" == 0 ]]; then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::advertisedMaxCapacity is 0. The signed approval likely recorded zero or did not persist.\n'
+          fi
+          if [[ "$control_gate" != open ]]; then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::localGate is not open. Resume the autopilot control gate before admitting work.\n'
+          fi
+          if [[ "$listener_heartbeat_age" == null ]]; then
+            printf '::warning title=Heartbeat pending::The first alarm has not recorded a heartbeat. Read listener status again.\n'
+          elif [[ "$listener_heartbeat_age" =~ ^[0-9]+$ ]] && (( listener_heartbeat_age > 60000 )); then
+            fleet_armed=false
+            printf '::warning title=Fleet not armed::heartbeatAgeMs is stale. Diagnose the listener and rearm the observed alarm generation.\n'
+          fi
+
+          if [[ "$fleet_armed" == true ]]; then
+            printf 'The fleet gates are armed. The listener can poll GitHub.\n'
+          else
+            printf 'The fleet did not arm. Fix the warnings and run the bootstrap again.\n'
+          fi

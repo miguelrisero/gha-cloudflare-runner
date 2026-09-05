@@ -1,0 +1,496 @@
+name: Listener watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      positive_control:
+        description: Send a synthetic finding through the Slack delivery path
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency: { group: listener-watchdog, cancel-in-progress: false }
+
+jobs:
+  watchdog:
+    name: Check listener health
+    # This watchdog MUST run on a GitHub-hosted runner. A watched-pool runner
+    # would deadlock when a jam prevented the watchdog job from starting.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Preflight the watchdog configuration
+        id: preflight
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ vars.WATCHDOG_SCALE_SET }}
+          POSITIVE_CONTROL: ${{ inputs.positive_control || false }}
+        run: |
+          set -euo pipefail
+          record_preflight_failure() {
+            local reason=$1
+            local action=$2
+            {
+              printf 'failure_reason<<LISTENER_WATCHDOG_EOF\n%s\nLISTENER_WATCHDOG_EOF\n' "$reason"
+              printf 'failure_action<<LISTENER_WATCHDOG_EOF\n%s\nLISTENER_WATCHDOG_EOF\n' "$action"
+            } >> "$GITHUB_OUTPUT"
+          }
+          settings_path='Settings > Secrets and variables > Actions'
+          scale_set_pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+          problems=()
+
+          if [[ "${POSITIVE_CONTROL:-false}" == 'true' ]]; then
+            exit 0
+          fi
+
+          if [[ -z "$WORKER_URL" ]]; then
+            problems+=("Repository variable WORKER_URL is missing. Create it at $settings_path.")
+          elif [[ "$WORKER_URL" != https://* ]]; then
+            problems+=("Repository variable WORKER_URL must begin with https://. Update it at $settings_path.")
+          fi
+          if [[ -z "$CONTROL_TOKEN" ]]; then
+            problems+=("Repository secret CONTROL_TOKEN is missing. Create it at $settings_path.")
+          fi
+          if [[ ! "$SCALE_SET" =~ $scale_set_pattern ]]; then
+            problems+=("Repository variable WATCHDOG_SCALE_SET is missing or invalid. Set a valid scale set name at $settings_path.")
+          fi
+
+          if (( ${#problems[@]} > 0 )); then
+            reason='Listener watchdog preflight failed. Fix every item below.'
+            for problem in "${problems[@]}"; do
+              reason+=$'\n- '
+              reason+="$problem"
+            done
+            action="Fix every listed item at $settings_path. Read docs/ALERTING.md."
+            printf '%s\n%s\n' "$reason" "$action" >&2
+            printf '\n::error title=Listener watchdog preflight::%s\n' "$action"
+            record_preflight_failure "$reason" "$action"
+            exit 1
+          fi
+
+      - name: Poll the listener and control status
+        id: watchdog
+        shell: bash
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          CONTROL_TOKEN: ${{ secrets.CONTROL_TOKEN }}
+          SCALE_SET: ${{ vars.WATCHDOG_SCALE_SET }}
+          POSITIVE_CONTROL: ${{ inputs.positive_control || false }}
+          LISTENER_WATCHDOG_STRANDED_COUNT: ${{ vars.LISTENER_WATCHDOG_STRANDED_COUNT }}
+          LISTENER_WATCHDOG_STRANDED_AGE_MS: ${{ vars.LISTENER_WATCHDOG_STRANDED_AGE_MS }}
+          LISTENER_WATCHDOG_DARK_MS: ${{ vars.LISTENER_WATCHDOG_DARK_MS }}
+        run: |
+          set -euo pipefail
+          watchdog_failure_reason=''
+          watchdog_failure_action=''
+          record_watchdog_failure() {
+            local reason=$1
+            local action=$2
+            if [[ -n "$watchdog_failure_reason" ]]; then
+              watchdog_failure_reason+=$'\n'
+            fi
+            watchdog_failure_reason+="$reason"
+            if [[ -z "$watchdog_failure_action" ]]; then
+              watchdog_failure_action=$action
+            fi
+          }
+          request_failure_reason=''
+          request_status() {
+            local label=$1
+            local url=$2
+            local output_file=$3
+            local curl_status=0
+            local http_status=''
+
+            http_status=$(
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --retry 3 \
+                --retry-all-errors \
+                --request GET \
+                --header "@$authorization_file" \
+                --output "$output_file" \
+                --write-out '%{http_code}' \
+                "$url"
+            ) || curl_status=$?
+
+            if (( curl_status != 0 )) || [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              request_failure_reason="$label request failed with curl code $curl_status and HTTP status ${http_status:-unavailable}."
+              printf '%s\n' "$request_failure_reason" >&2
+              printf '\n::error title=Listener watchdog poll::%s\n' \
+                "$request_failure_reason"
+              return 1
+            fi
+          }
+
+          umask 077
+          listener_file=$(mktemp "$RUNNER_TEMP/listener-watchdog-listener.XXXXXX")
+          control_file=$(mktemp "$RUNNER_TEMP/listener-watchdog-control.XXXXXX")
+          reservation_file=$(mktemp "$RUNNER_TEMP/listener-watchdog-reservations.XXXXXX")
+          authorization_file=$(mktemp "$RUNNER_TEMP/listener-watchdog-authorization.XXXXXX")
+          evaluator_stderr=$(mktemp "$RUNNER_TEMP/listener-watchdog-stderr.XXXXXX")
+          trap 'rm -f -- "$listener_file" "$control_file" "$reservation_file" "$authorization_file" "$evaluator_stderr"' EXIT
+          evaluator_arguments=(evaluate --positive-control)
+          if [[ "${POSITIVE_CONTROL:-false}" != 'true' ]]; then
+            printf 'Authorization: Bearer %s\n' "$CONTROL_TOKEN" \
+              > "$authorization_file"
+
+            worker_url=${WORKER_URL%/}
+            encoded_scale_set=$(jq -nr --arg value "$SCALE_SET" '$value | @uri')
+            listener_url="$worker_url/autopilot/listener/$encoded_scale_set"
+            control_url="$worker_url/autopilot/control"
+            # Live reservations span three states, so no one state filter is safe.
+            # The endpoint's existing 100-row ceiling bounds this single page.
+            # Ascending request time makes its first visible live row globally
+            # oldest. A page without one fails closed instead of guessing.
+            reservation_url="$worker_url/autopilot/control/reservations?limit=100"
+
+            if ! request_status 'Listener status' "$listener_url" "$listener_file"; then
+              record_watchdog_failure \
+                "$request_failure_reason" \
+                'Check WORKER_URL, CONTROL_TOKEN, and the Worker status. Read docs/ALERTING.md.'
+              printf 'null\n' > "$listener_file"
+            fi
+            if ! request_status 'Control status' "$control_url" "$control_file"; then
+              record_watchdog_failure \
+                "$request_failure_reason" \
+                'Check WORKER_URL, CONTROL_TOKEN, and the Worker status. Read docs/ALERTING.md.'
+              printf 'null\n' > "$control_file"
+            fi
+            if ! request_status 'Reservation status' "$reservation_url" "$reservation_file"; then
+              record_watchdog_failure \
+                "$request_failure_reason" \
+                'Check WORKER_URL, CONTROL_TOKEN, and the Worker status. Read docs/ALERTING.md.'
+              printf 'null\n' > "$reservation_file"
+            fi
+            evaluator_arguments=(
+              evaluate
+              "$listener_file"
+              "$control_file"
+              "$reservation_file"
+            )
+          fi
+
+          evaluator_exit_code=0
+          set +e
+          node scripts/lib/listener-health.mjs "${evaluator_arguments[@]}" \
+            > listener-watchdog.json 2> "$evaluator_stderr"
+          evaluator_exit_code=$?
+          set -e
+          if [[ -s "$evaluator_stderr" ]]; then
+            cat "$evaluator_stderr" >&2
+          fi
+
+          exit_code=$evaluator_exit_code
+          if [[ ! "$exit_code" =~ ^[012]$ ]]; then
+            record_watchdog_failure \
+              "The listener health evaluator returned invalid exit code $exit_code." \
+              'Read the evaluator error and docs/ALERTING.md.'
+            exit_code=2
+          fi
+          if ! jq -e \
+            'type == "object" and (.findings | type) == "array" and (.exitCode | type) == "number"' \
+            >/dev/null 2>&1 listener-watchdog.json; then
+            record_watchdog_failure \
+              'The listener health evaluator did not produce a valid JSON result.' \
+              'Read the evaluator error and docs/ALERTING.md.'
+            printf '{"findings":[],"exitCode":2}\n' > listener-watchdog.json
+            exit_code=2
+          elif ! jq -e --argjson expected "$exit_code" \
+            '.exitCode == $expected' >/dev/null listener-watchdog.json; then
+            record_watchdog_failure \
+              'The listener health evaluator output did not match its process exit code.' \
+              'Read the evaluator output and docs/ALERTING.md.'
+            exit_code=2
+            jq '.exitCode = 2' listener-watchdog.json \
+              > listener-watchdog.corrected.json
+            mv listener-watchdog.corrected.json listener-watchdog.json
+          fi
+          if [[ "$exit_code" == '2' && -z "$watchdog_failure_reason" ]]; then
+            evaluator_error=$(sed -n '1p' "$evaluator_stderr")
+            record_watchdog_failure \
+              "The listener watchdog had an operational failure. ${evaluator_error:-The evaluator could not complete.}" \
+              'Read the job log and docs/ALERTING.md.'
+          fi
+
+          {
+            printf 'exit_code=%s\n' "$exit_code"
+            printf 'failure_reason<<LISTENER_WATCHDOG_EOF\n%s\nLISTENER_WATCHDOG_EOF\n' \
+              "$watchdog_failure_reason"
+            printf 'failure_action<<LISTENER_WATCHDOG_EOF\n%s\nLISTENER_WATCHDOG_EOF\n' \
+              "$watchdog_failure_action"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert on the watchdog result
+        if: always()
+        shell: bash
+        env:
+          WATCHDOG_EXIT_CODE: ${{ steps.watchdog.outputs.exit_code }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          WATCHDOG_OUTCOME: ${{ steps.watchdog.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          PREFLIGHT_FAILURE_REASON: ${{ steps.preflight.outputs.failure_reason }}
+          PREFLIGHT_FAILURE_ACTION: ${{ steps.preflight.outputs.failure_action }}
+          WATCHDOG_FAILURE_REASON: ${{ steps.watchdog.outputs.failure_reason }}
+          WATCHDOG_FAILURE_ACTION: ${{ steps.watchdog.outputs.failure_action }}
+          POSITIVE_CONTROL: ${{ inputs.positive_control || false }}
+          SLACK_WEBHOOK_URL: ${{ secrets.LISTENER_WATCHDOG_SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNBOOK_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/docs/ALERTING.md
+        run: |
+          set -euo pipefail
+          exit_code="${WATCHDOG_EXIT_CODE:-2}"
+          positive_control="${POSITIVE_CONTROL:-false}"
+          if [[ "$WATCHDOG_OUTCOME" == 'skipped' ]]; then
+            exit_code=2
+          fi
+          case "$exit_code" in
+            0)
+              if [[ "$positive_control" != 'true' ]]; then
+                # A healthy pool must be silent. Repeated healthy messages train
+                # the channel to ignore the watchdog.
+                exit 0
+              fi
+              ;;
+            1 | 2)
+              ;;
+            *)
+              exit_code=2
+              ;;
+          esac
+
+          failure_reason=''
+          failure_action=''
+          if [[ "$WATCHDOG_OUTCOME" == 'skipped' ]]; then
+            failure_reason="${PREFLIGHT_FAILURE_REASON:-}"
+            failure_action="${PREFLIGHT_FAILURE_ACTION:-}"
+          else
+            failure_reason="${WATCHDOG_FAILURE_REASON:-}"
+            failure_action="${WATCHDOG_FAILURE_ACTION:-}"
+          fi
+          if [[ "$exit_code" == '2' ]]; then
+            if [[ -z "$failure_reason" ]]; then
+              failure_reason='The listener watchdog did not complete.'
+            fi
+            if [[ -z "$failure_action" ]]; then
+              failure_action='Open the run log and read docs/ALERTING.md.'
+            fi
+          fi
+
+          findings_json='[]'
+          if [[ -s listener-watchdog.json ]]; then
+            if ! findings_json=$(jq -ce \
+              '.findings | select(type == "array")' \
+              listener-watchdog.json 2>/dev/null); then
+              findings_json='[]'
+            fi
+          fi
+
+          if [[ "$positive_control" == 'true' && "$exit_code" == '0' ]]; then
+            header_text='Runner pool: listener watchdog delivery test'
+            color='#e8912d'
+          elif [[ "$exit_code" == '1' ]]; then
+            header_text='Runner pool: listener watchdog finding'
+            color='#e8912d'
+            if jq -e 'any(.[]; .severity == "critical")' \
+              >/dev/null <<<"$findings_json"; then
+              color='#d13212'
+            fi
+          else
+            header_text='Runner pool: listener watchdog did not run'
+            color='#d13212'
+          fi
+
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            printf '\n::warning title=Listener watchdog alert degraded::Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery is not configured. The alert uses GitHub workflow-failure notification only.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          findings_text=$(jq -r '
+            [
+              .[]
+              | select(type == "object")
+              | "*\(.code // "unknown")* \(.summary // "No summary is available.")"
+            ]
+            | join("\n")
+          ' <<<"$findings_json")
+          if [[ -z "$findings_text" ]]; then
+            printf -v findings_text '*Cause*\n%s' "$failure_reason"
+          fi
+          action_text=$(jq -r '
+            [
+              .[]
+              | select(type == "object")
+              | .action
+              | select(type == "string" and length > 0)
+            ]
+            | unique
+            | map("- " + .)
+            | join("\n")
+          ' <<<"$findings_json")
+          if [[ -z "$action_text" ]]; then
+            action_text=$failure_action
+          fi
+          printf -v action_text '*Do this*\n%s' "$action_text"
+          fields_json=$(jq -c '
+            [
+              .[]
+              | select(type == "object")
+              | {
+                  type: "mrkdwn",
+                  text: (
+                    (
+                      "*\(.code // "unknown")*\n"
+                      + (
+                          [
+                            .fields
+                            | select(type == "object")
+                            | to_entries[]
+                            | "`\(.key)`: \(.value | tostring)"
+                          ]
+                          | join("\n")
+                        )
+                    )
+                    | .[0:3000]
+                  )
+                }
+            ]
+          ' <<<"$findings_json")
+          printf -v context_text \
+            "exit code \`%s\` | <%s|Open the run> | <%s|Runbook>" \
+            "$exit_code" "$RUN_URL" "$RUNBOOK_URL"
+          first_line=${findings_text%%$'\n'*}
+          printf -v fallback 'Listener watchdog exit code %s - %s' \
+            "$exit_code" "$first_line"
+
+          payload=$(jq -n \
+            --arg headerText "$header_text" \
+            --arg color "$color" \
+            --arg fallback "$fallback" \
+            --arg findingsText "$findings_text" \
+            --arg actionText "$action_text" \
+            --arg contextText "$context_text" \
+            --argjson findingFields "$fields_json" '
+              {
+                text: ($fallback | .[0:3000]),
+                attachments: [
+                  {
+                    color: $color,
+                    fallback: ($fallback | .[0:3000]),
+                    blocks: (
+                      [
+                        {
+                          type: "header",
+                          text: {
+                            type: "plain_text",
+                            text: ($headerText | .[0:150])
+                          }
+                        },
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: ($findingsText | .[0:3000])
+                          }
+                        }
+                      ]
+                      + (
+                        if ($findingFields | length) > 0 then
+                          [
+                            {
+                              type: "section",
+                              fields: $findingFields
+                            }
+                          ]
+                        else
+                          []
+                        end
+                      )
+                      + [
+                        {
+                          type: "section",
+                          text: {
+                            type: "mrkdwn",
+                            text: ($actionText | .[0:3000])
+                          }
+                        },
+                        {
+                          type: "context",
+                          elements: [
+                            {
+                              type: "mrkdwn",
+                              text: ($contextText | .[0:3000])
+                            }
+                          ]
+                        }
+                      ]
+                    )
+                  }
+                ]
+              }
+            ')
+          slack_response=''
+          if ! slack_response=$(curl --fail-with-body --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"); then
+            if [[ -n "$slack_response" ]]; then
+              printf '%s\n' "$slack_response" >&2
+            fi
+            printf '\n::error title=Listener watchdog Slack delivery::Slack delivery failed. Use the workflow result and listener-watchdog.json.\n'
+            {
+              printf '\n> [!WARNING]\n'
+              printf '> Slack delivery failed. Use the workflow result and listener-watchdog.json.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set the watchdog result
+        if: always()
+        shell: bash
+        env:
+          WATCHDOG_EXIT_CODE: ${{ steps.watchdog.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          exit_code="${WATCHDOG_EXIT_CODE:-2}"
+          case "$exit_code" in
+            0 | 1 | 2)
+              exit "$exit_code"
+              ;;
+            *)
+              printf 'The watchdog did not produce a valid exit code.\n' >&2
+              exit 2
+              ;;
+          esac

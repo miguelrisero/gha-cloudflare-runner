@@ -1,0 +1,125 @@
+name: Registration cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Delete selected registrations. False reports only.
+        type: boolean
+        default: false
+      confirm:
+        description: Type DELETE to authorise an apply run.
+        type: string
+        default: ''
+      limit:
+        description: Maximum registrations to delete in this run.
+        type: string
+        default: '250'
+      scale_set_id:
+        description: Optional scale set identifier filter.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency: { group: registration-cleanup, cancel-in-progress: false }
+
+jobs:
+  cleanup:
+    name: Clean runner registrations
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Preflight the cleanup configuration
+        shell: bash
+        env:
+          CLEANUP_GITHUB_TOKEN: ${{ secrets.RUNNER_CLEANUP_GITHUB_TOKEN || secrets.AUDIT_GITHUB_TOKEN }}
+          APPLY_INPUT: ${{ inputs.apply }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CLEANUP_GITHUB_TOKEN" ]]; then
+            printf '%s\n' 'RUNNER_CLEANUP_GITHUB_TOKEN or AUDIT_GITHUB_TOKEN is required.' >&2
+            exit 1
+          fi
+          if [[ "$APPLY_INPUT" == 'true' && "$CONFIRM_INPUT" != 'DELETE' ]]; then
+            printf '%s\n' 'An apply run requires the exact confirmation DELETE.' >&2
+            exit 1
+          fi
+
+      - name: Run the registration cleanup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_CLEANUP_GITHUB_TOKEN || secrets.AUDIT_GITHUB_TOKEN }}
+          APPLY_INPUT: ${{ inputs.apply }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          LIMIT_INPUT: ${{ inputs.limit }}
+          SCALE_SET_ID_INPUT: ${{ inputs.scale_set_id }}
+        run: |
+          set -euo pipefail
+          arguments=(
+            --scope organization
+            --organization example-org
+            --limit "$LIMIT_INPUT"
+            --report registration-cleanup-report.json
+          )
+          if [[ -n "$SCALE_SET_ID_INPUT" ]]; then
+            arguments+=(--scale-set-id "$SCALE_SET_ID_INPUT")
+          fi
+          if [[ "$APPLY_INPUT" == 'true' && "$CONFIRM_INPUT" == 'DELETE' ]]; then
+            arguments+=(--apply)
+          fi
+          node scripts/registration-cleanup.mjs "${arguments[@]}"
+
+      - name: Write the cleanup summary
+        if: always() && hashFiles('registration-cleanup-report.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '## Registration cleanup\n\n'
+            printf '| Field | Value |\n'
+            printf '| --- | ---: |\n'
+            jq -r '
+              "| Scope | \(.scope) |",
+              "| Apply | \(.apply) |",
+              "| Token scopes | \(.tokenScopes // "none (fine-grained token)") |",
+              "| Delete capability | \(.deleteCapability) |",
+              "| Refused | \(.refused) |",
+              "| Refusal reason | \(.refusalReason // "none") |",
+              "| Census pages fetched | \(.censusPagesFetched // "unknown") |",
+              "| Initial registrations | \(.initialRegistrations // "unknown") |",
+              "| Reaped during census | \(.removedDuringCensus // "unknown") |",
+              "| Total registrations | \(.totalRegistrations) |",
+              "| Delete targets | \(.counts.delete) |",
+              "| Attempted | \(.attempted) |",
+              "| Deleted | \(.deleted) |",
+              "| Already absent | \(.alreadyAbsent) |",
+              "| Busy skipped | \(.busySkipped) |",
+              "| Remaining | \(.remaining) |"
+            ' registration-cleanup-report.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the cleanup report
+        if: always() && hashFiles('registration-cleanup-report.json') != ''
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: registration-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: registration-cleanup-report.json
